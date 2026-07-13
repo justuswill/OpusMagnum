@@ -2,7 +2,7 @@
 """
 solve.py — compute lower/upper bounds for the metrics of the optimal SUM solution.
 
-Lower bounds come from analytic proofs in puzzle_parser.py (throughput, minimum
+Lower bounds come from analytic proofs in bounds.py (throughput, minimum
 part cost, molecule footprint).  Upper bounds come from the best SUM record on
 the leaderboard (stored locally).  The omsim simulator verifies that the SUM
 solution actually achieves the metrics it claims.
@@ -20,7 +20,9 @@ import os
 import re
 import subprocess
 
-from puzzle_parser import parse_puzzle, cycles_lower_bound, cost_lower_bound, area_lower_bound
+from puzzle_parser import parse_puzzle, ATOM_NAMES
+from bounds import cycles_lower_bound, cost_lower_bound, area_lower_bound
+from stoichiometry import solve_recipe, describe_molecule
 
 PUZZLES_DIR = os.path.join(os.path.dirname(__file__), "puzzles")
 OMSIM_BIN   = os.path.join(os.path.dirname(__file__), "omsim", "omsim")
@@ -93,15 +95,56 @@ def verify_with_omsim(puzzle_file, solution_file):
     return out
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Compute proven bounds for the optimal SUM solution.")
-    parser.add_argument("--puzzle", default="P007", metavar="ID", help="Puzzle ID (default: P007)")
-    args = parser.parse_args()
+_OMSIM_KEY_TO_SCORE_KEY = {"cost": "g", "cycles": "c", "area": "a", "instructions": "i"}
+
+
+def verify_all_solutions(folder, puzzle_file, scores, files):
+    """Verify every found solution with omsim, overriding any score fields that
+    the filename got wrong with the omsim-computed value. Silent unless a
+    mismatch is found and overridden."""
+    for cat, fname in files.items():
+        actual = verify_with_omsim(puzzle_file, os.path.join(folder, fname))
+        for omsim_key, score_key in _OMSIM_KEY_TO_SCORE_KEY.items():
+            if omsim_key not in actual:
+                continue
+            exp = scores[cat][score_key]
+            act = actual[omsim_key]
+            if exp is not None and act != exp:
+                print(f"  {fname}: {score_key}={exp} was wrong, overridden with omsim value {act}")
+                scores[cat][score_key] = act
+
+
+def print_recipe(pf, result):
+    print("Recipe (stoichiometry):")
+    if result.status != "Optimal":
+        print(f"  {result.status} — no atom-balanced recipe found")
+        return
+    for i, mol in enumerate(pf.inputs):
+        count = result.reagent_counts.get(i, 0)
+        if count:
+            group_size = result.reagent_group_size.get(i, 1)
+            suffix = f"[x{group_size}]" if group_size > 1 else ""
+            print(f"  {count:>4}x  input {i}{suffix}: {describe_molecule(mol)}")
+    products_needed = pf.products_needed()
+    for i, mol in enumerate(pf.outputs):
+        print(f"  {products_needed:>4}x  output {i}: {describe_molecule(mol)}")
+    if result.reaction_counts:
+        print("  Transformations:")
+        for name, count in sorted(result.reaction_counts.items()):
+            print(f"  {count:>4}x  {name}")
+    if result.waste:
+        print("  Waste (surplus atoms produced beyond what's needed):")
+        for atype, count in sorted(result.waste.items()):
+            print(f"  {count:>4}x  {ATOM_NAMES.get(atype, atype)}")
+
+
+def main(args):
     pid = args.puzzle.strip()
     folder, collection = find_puzzle_dir(pid)
     name = os.path.basename(folder)[len(pid):].lstrip("-").replace("-", " ") or pid
     scores, solution_files = parse_solutions(folder, pid)
     pf, puzzle_file = load_puzzle(folder, pid)
+    verify_all_solutions(folder, puzzle_file, scores, solution_files)
 
     is_prod = any(cat.endswith("_P") for cat in scores)
     if is_prod:
@@ -114,19 +157,22 @@ def main():
         sum_label = "g+c+a"
     if sum_cat not in scores:
         raise ValueError(f"no {sum_cat} solution file found in {folder}")
-    ss = scores[sum_cat]
 
     print(f"Puzzle    : {name} ({pid})")
     print(f"Collection: {collection}")
     print(f"Type      : {'PRODUCTION' if is_prod else 'NORMAL'}")
     print()
 
+    recipe = solve_recipe(pf)
+    print_recipe(pf, recipe)
+    print()
+
     # ── Analytic lower bounds ─────────────────────────────────────────────
 
     g_lo, g_note = cost_lower_bound(pf)
-    c_lo, c_note = cycles_lower_bound(pf)
+    c_lo, c_note = cycles_lower_bound(pf, recipe)
     if not is_prod:
-        t_lo, t_note = area_lower_bound(pf)
+        t_lo, t_note = area_lower_bound(pf, recipe)
     else:
         t_lo, t_note = 1, "trivial (≥1 instruction)"
 
@@ -154,6 +200,11 @@ def main():
         return (f"  {label:<18}  {lo:>5}  " +
                 "  ".join(cell(vals[c], lo, col_w) for c in present_cats))
 
+    print(f"  {'cost (g)':<18}>= {g_lo:<5} {g_note}")
+    print(f"  {'cycles (c)':<18}>= {c_lo:<5} {c_note}")
+    print(f"  {t_label:<18}>= {t_lo:<5} {t_note}")
+    print()
+
     print("Lower bounds vs. records  (* = bound achieved):")
     print(header)
     print(sep)
@@ -177,7 +228,7 @@ def main():
     # ── Upper bounds from best SUM record ─────────────────────────────────
 
     sum_hi = sums[sum_cat]
-    g_hi = sum_hi - c_lo - t_lo
+    g_hi = (sum_hi - c_lo - t_lo) // 5 * 5  # every part costs a multiple of 5g
     c_hi = sum_hi - g_lo - t_lo
     t_hi = sum_hi - g_lo - c_lo
 
@@ -187,33 +238,9 @@ def main():
     print(f"  cycles (c)        : {format_bound(c_lo, c_hi)}")
     print(f"  {t_label:<18}: {format_bound(t_lo, t_hi)}")
 
-    # ── omsim verification ────────────────────────────────────────────────
-
-    sum_fname = solution_files.get(sum_cat)
-    if sum_fname:
-        print()
-        print(f"Verifying {sum_cat} solution with omsim...")
-        try:
-            actual = verify_with_omsim(puzzle_file, os.path.join(folder, sum_fname))
-            name_map = {"cost": "g", "cycles": "c", "area": "a", "instructions": "i"}
-            ok = True
-            for omsim_key, score_key in name_map.items():
-                if omsim_key not in actual:
-                    continue
-                act = actual[omsim_key]
-                exp = ss[score_key]
-                if exp is None:
-                    print(f"  {omsim_key}: {act}  (filename has 'na')")
-                elif act == exp:
-                    print(f"  {omsim_key}: {act}  OK")
-                else:
-                    print(f"  {omsim_key}: {act}  MISMATCH (filename claims {exp})")
-                    ok = False
-            if ok:
-                print("=> Verified.")
-        except Exception as e:
-            print(f"  (skipped: {e})")
-
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Compute proven bounds for the optimal SUM solution.")
+    parser.add_argument("--puzzle", default="P007", metavar="ID", help="Puzzle ID (default: P007)")
+    args = parser.parse_args()
+    main(args)
