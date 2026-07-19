@@ -7,6 +7,7 @@ See PLAN.md §7.4/§7.5: a metric is *proven optimal* when one of these bounds
 equals the best known record.
 """
 
+import itertools
 import math
 from collections import Counter
 
@@ -16,8 +17,258 @@ from puzzle_parser import (
     ELEMENTALS,
     PART_BARON, PART_PROJECTION, PART_PURIFICATION,
 )
-from stoichiometry import RecipeResult, METAL_CHAIN, necessary_inputs
-from scheme import critical_path_latency
+from stoichiometry import RecipeResult, METAL_CHAIN, necessary_inputs, describe_molecule
+from schematic import StateGraph, molecule_signature
+
+
+def _all_paths_nodes(graph: StateGraph, start: int, goal: int) -> list:
+    """Every path from `start` to `goal` over graph.edges, each as the
+    sequence of node indices along it (including both endpoints). The state
+    graph is a finite DAG (schematic.py's module docstring), so no node can
+    ever recur on a path — plain DFS enumeration needs no visited-set/cycle
+    bookkeeping to stay correct, just to terminate on a finite graph."""
+    if start == goal:
+        return [[goal]]
+    paths = []
+
+    def dfs(node, path):
+        for nxt in graph.edges[node]:
+            if nxt == start:
+                paths.append([nxt] + path)
+            else:
+                dfs(nxt, [nxt] + path)
+
+    dfs(goal, [goal])
+    return paths
+
+
+def _reagent_sig(pf: PuzzleFile, recipe: RecipeResult) -> dict:
+    return {molecule_signature(pf.inputs[i]): i
+            for i, count in recipe.reagent_counts.items() if count > 0}
+
+
+def _path_raw_ls(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph, path: list) -> dict:
+    """Per-reagent-type raw_L values for one path, given in
+    forward-chronological order (path[0] = the fully-decomposed raw-reagent
+    state, path[-1] = the output state — see _all_paths_nodes). Walk it and,
+    for each reagent type, note the forward step k at which each instance
+    disappears from the state (i.e. gets grabbed and folded into a
+    bond/reaction at that step). raw_L is not k itself but D-k+1 — the
+    number of steps from that grab through to the output, *inclusive of the
+    grab's own step* — since what actually gates the last copy's completion
+    is how much sequential work is still ahead of a given grab, not how much
+    came before it: a reagent grabbed early but feeding a long downstream
+    chain is more of a bottleneck than one grabbed late that's used
+    immediately. Split out from _path_l_spine so _cadence_latency can
+    compute it once per distinct path and reuse it across every period-many
+    path assignment it tries (see _cadence_latency)."""
+    D = len(path) - 1
+    reagent_sig = _reagent_sig(pf, recipe)
+
+    def type_counts(node):
+        counts = Counter()
+        for mol in graph.states[node].molecules:
+            sig = molecule_signature(mol)
+            if sig in reagent_sig:
+                counts[sig] += 1
+        return counts
+
+    raw_ls = {}
+    prev_counts = type_counts(path[0])
+    for k in range(1, D + 1):
+        cur_counts = type_counts(path[k])
+        for sig, prev_count in prev_counts.items():
+            consumed = prev_count - cur_counts.get(sig, 0)
+            if consumed > 0:
+                raw_ls.setdefault(sig, []).extend([D - k + 1] * consumed)
+        prev_counts = cur_counts
+    return raw_ls
+
+
+def _path_l_spine(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph,
+                   paths: list, raw_ls_by_path: dict) -> tuple[int, str]:
+    """L_spine for one period-many assignment of paths, one path per product
+    in the group (period == 1 outside the uneven-split case — see
+    _cadence_latency; each product can walk its own structurally-distinct
+    path, since the real solution isn't required to route every product in
+    a period the same way). Every assigned path's raw_L pool (already
+    computed in raw_ls_by_path, keyed by id(path) — see _path_raw_ls) is
+    appended together per reagent type before the parallel-glyph adjustment.
+
+    Parallel-glyph instances of the same type don't stack their raw_L values
+    directly — since `repeats` glyphs jointly supply 1 new molecule every 2
+    cycles (the same cadence N's own formula uses), sort a type's raw_L
+    values descending and subtract 2*(num_blocks - idx//repeats - 1) before
+    taking the max; that's the type's own contribution (a
+    rearrangement-inequality argument: the best possible schedule pairs the
+    earliest-arriving grab with the least-urgent need). num_blocks comes
+    straight from the puzzle's recipe (c.f. cycles_lower_bound's own
+    count/repeats throughput term) scaled by len(paths), since that's
+    exactly how much more total demand there is to spread across the same
+    `repeats` glyphs once several products are grouped into one period.
+    L_spine = max over every reagent type's contribution.
+
+    Delays inherently compound toward the *end* of the forward process, so
+    the "steps that actually matter" for display are always the last
+    L_spine moves of the winning path (closest to the output), not tied to
+    any particular instance.
+
+    Only each product's own bottleneck (max adjusted value among its own
+    reagent instances) competes for the shared output-drop slot — other,
+    non-maximal grabs within the same product are already accounted for by
+    that product's own max and don't separately queue for anything. Among
+    those per-product bottlenecks, only one product's output can drop per
+    cycle, so ties (or near-ties once queueing compounds them) push later
+    ones out by however many cycles they're stuck behind — the standard
+    exchange-argument-optimal schedule for single-resource unit-time
+    scheduling with release times: sort bottlenecks ascending and greedily
+    bump each into max(bottleneck, previous_completion + 1).
+
+    Which instance lands in which block is itself a choice — pure
+    value-descending order (ignoring which product an instance belongs to)
+    minimizes each sig's own peak in isolation, but can pack several
+    different products' top instances into the very same block, manufacturing
+    queue collisions a p_idx-grouped order (keeping a product's own instances
+    contiguous, so it alone occupies the best block) would avoid. Try the
+    plain value order plus, for k=1..len(paths)-1, keeping p_idx 0..k-1 each
+    in their own sorted group (in p_idx order) with the rest pooled and
+    sorted after — len(paths) candidates total — and keep whichever gives
+    the smallest L_spine."""
+    reagent_sig = _reagent_sig(pf, recipe)
+
+    combined = {}
+    for p_idx, path in enumerate(paths):
+        for sig, values in raw_ls_by_path[id(path)].items():
+            combined.setdefault(sig, []).extend((v, p_idx) for v in values)
+
+    if not combined:
+        return 0, "no reagents consumed along path"
+
+    num_blocks = max(
+        math.ceil((recipe.reagent_counts[i] // (pf.products_needed() / len(paths))) / recipe.reagent_group_size.get(i, 1))
+        for i in reagent_sig.values()
+    )
+
+    def value_order(pairs):
+        return sorted(pairs, key=lambda vp: -vp[0])
+
+    def prefix_order(pairs, k):
+        groups = [sorted((vp for vp in pairs if vp[1] == p), key=lambda vp: -vp[0]) for p in range(k)]
+        groups.append(sorted((vp for vp in pairs if vp[1] >= k), key=lambda vp: -vp[0]))
+        return [vp for group in groups for vp in group]
+
+    def solve(order_fn):
+        bottleneck_by_p = {}
+        for sig, pairs in combined.items():
+            i = reagent_sig[sig]
+            repeats = recipe.reagent_group_size.get(i, 1)
+            for idx, (v, p_idx) in enumerate(order_fn(pairs)):
+                adjusted = v - 2 * (num_blocks - idx // repeats - 1)
+                cur = bottleneck_by_p.get(p_idx)
+                if cur is None or adjusted > cur[0]:
+                    bottleneck_by_p[p_idx] = (adjusted, i)
+
+        bottlenecks = sorted(((adjusted, i, p_idx) for p_idx, (adjusted, i) in bottleneck_by_p.items()),
+                              key=lambda b: b[0])
+        natural_peak = bottlenecks[-1][0]
+        running = None
+        L_spine, i, p_idx = bottlenecks[0]
+        for adjusted, bi, bp_idx in bottlenecks:
+            running = adjusted if running is None else max(adjusted, running + 1)
+            if running > L_spine:
+                L_spine, i, p_idx = running, bi, bp_idx
+        return L_spine, natural_peak, i, p_idx
+
+    order_fns = [value_order] + [(lambda pairs, k=k: prefix_order(pairs, k)) for k in range(1, len(paths))]
+    L_spine, natural_peak, i, p_idx = min((solve(fn) for fn in order_fns), key=lambda r: r[0])
+
+    path = paths[p_idx]
+    D = len(path) - 1
+    moves = [graph.edge_move[(path[k], path[k - 1])] for k in range(1, D + 1)]
+    blocking_moves = moves[max(D - L_spine, 0):]
+    steps = " + ".join(f"{mv}=1" for mv in blocking_moves) if blocking_moves else "already available"
+    penalty = L_spine - natural_peak
+    if penalty:
+        steps += f" + extra_output_delay={penalty}"
+    note = f"{describe_molecule(pf.inputs[i])}: {steps}"
+    return L_spine, note
+
+
+def _prune_dominated_paths(paths: list, raw_ls_by_path: dict, reagent_sig: dict) -> list:
+    """Drop any path whose raw_L values are componentwise >= some other
+    path's, sig-by-sig, rank-by-rank (both sorted descending first, since
+    _path_l_spine only cares about each type's sorted raw_L pool, not which
+    grab produced which value). Such a path can never beat the dominating
+    one in any combination _cadence_latency tries — substituting the
+    dominating path in its place only pushes every merged rank down or
+    leaves it unchanged, so the achieved minimum L_spine can only get
+    smaller or stay the same — so it's safe to drop before the
+    combinations_with_replacement blow-up."""
+    sigs = list(reagent_sig)
+    sorted_values = {
+        id(path): {sig: sorted(raw_ls_by_path[id(path)].get(sig, []), reverse=True) for sig in sigs}
+        for path in paths
+    }
+
+    def le_all(a, b):
+        va, vb = sorted_values[id(a)], sorted_values[id(b)]
+        return all(x <= y for sig in sigs for x, y in zip(va[sig], vb[sig]))
+
+    kept = []
+    for i, path in enumerate(paths):
+        dominated = False
+        for j, other in enumerate(paths):
+            if i == j:
+                continue
+            if le_all(other, path) and (not le_all(path, other) or j < i):
+                dominated = True
+                break
+        if not dominated:
+            kept.append(path)
+    return kept
+
+
+def _cadence_latency(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph) -> tuple[int, str]:
+    """L_spine across every structurally-distinct path from the raw reagents
+    to the output (see schematic.py; _all_paths_nodes returns them in this
+    forward-chronological order), not just one shortest path: the real
+    optimal solution corresponds to exactly one of these paths, and we
+    don't know which, so the only value provably safe as a lower bound is
+    the smallest L_spine any of them produces — picking a larger one would
+    risk overshooting the true minimum on whichever path the real solution
+    actually follows. See _path_l_spine for the per-path algorithm.
+
+    When some reagent's per-product demand doesn't split evenly across its
+    parallel glyphs, no single product's raw_L pool matches
+    recipe.reagent_counts on its own — the uneven remainder only evens out
+    again after `period` products (e.g. 4 needed per product over 3
+    duplicates: 2/1/1, 1/2/1, 1/1/2, realigning every 3 products). So instead
+    of trying one path per product, we try every length-`period` multiset of
+    paths (each product in the group can route through a different
+    structural path; combinations_with_replacement rather than product
+    since _path_l_spine only pools the assigned paths' raw_L values —
+    "aab" and "aba" score identically, so there's no need to check both),
+    and keep the smallest L_spine across every combination, same
+    safe-lower-bound reasoning as the single-path case."""
+    products_needed = pf.products_needed()
+    period = 1
+    for i, count in recipe.reagent_counts.items():
+        if count <= 0:
+            continue
+        repeats = recipe.reagent_group_size.get(i, 1)
+        unit_count = count // products_needed
+        period = math.lcm(period, repeats // math.gcd(unit_count, repeats))
+
+    paths = _all_paths_nodes(graph, graph.input_state_idx, 0)
+    raw_ls_by_path = {id(path): _path_raw_ls(pf, recipe, graph, path) for path in paths}
+    paths = _prune_dominated_paths(paths, raw_ls_by_path, _reagent_sig(pf, recipe))
+
+    best = None
+    for assignment in itertools.combinations_with_replacement(paths, period):
+        L_spine, note = _path_l_spine(pf, recipe, graph, list(assignment), raw_ls_by_path)
+        if best is None or L_spine < best[0]:
+            best = (L_spine, note)
+    return best
 
 
 def _bond_type_counts(mols):
@@ -42,7 +293,7 @@ def _bond_type_counts(mols):
     return normal, triplex
 
 
-def cycles_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
+def cycles_lower_bound(pf: PuzzleFile, recipe: RecipeResult, states: StateGraph) -> tuple[int, str]:
     """
     Throughput (N) + Steps (L) (+ 1) lower bound on cycle count.
     Each input may have their own N, L so one dominates.
@@ -81,16 +332,15 @@ def cycles_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
         if cycles > N:
             N = cycles
             note = (f"input throughput {N}: {count}x needed from input {i}"
-                    + f" with {repeats} duplicates" if repeats > 1 else "")
+                    + (f" with {repeats} duplicates" if repeats > 1 else ""))
 
-    l_notes = []
-    L, l_note = critical_path_latency(pf, recipe)
-    l_notes += [(l_note, L)]
+    L, spine_note = _cadence_latency(pf, recipe, states)
+    latency_parts = [spine_note]
     all_repeating = all(any(a.type == ATOM_REPEAT for a in mol.atoms) for mol in pf.outputs)
     if not all_repeating:
-        l_notes.append(("drop", 1))  # last drop isn't pipelined away unless every output repeats
-    L = sum(val for _, val in l_notes)
-    latency_note = (f"input latency {L}: " + " + ".join(f"{name}={val}" for name, val in l_notes))
+        latency_parts.append("drop=1")  # last drop isn't pipelined away unless every output repeats
+        L += 1
+    latency_note = f"input latency {L}: " + " + ".join(latency_parts)
 
     return N + L, f"{note}, {latency_note}"
 

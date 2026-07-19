@@ -23,6 +23,7 @@ import subprocess
 from puzzle_parser import parse_puzzle, ATOM_NAMES
 from bounds import cycles_lower_bound, cost_lower_bound, area_lower_bound
 from stoichiometry import solve_recipe, describe_molecule
+from schematic import reachable_states
 
 PUZZLES_DIR = os.path.join(os.path.dirname(__file__), "puzzles")
 OMSIM_BIN   = os.path.join(os.path.dirname(__file__), "omsim", "omsim")
@@ -164,13 +165,16 @@ def main(args):
     print()
 
     recipe = solve_recipe(pf)
+    states = reachable_states(pf, recipe)
     print_recipe(pf, recipe)
+    print()
+    print(states)
     print()
 
     # ── Analytic lower bounds ─────────────────────────────────────────────
 
     g_lo, g_note = cost_lower_bound(pf)
-    c_lo, c_note = cycles_lower_bound(pf, recipe)
+    c_lo, c_note = cycles_lower_bound(pf, recipe, states)
     if not is_prod:
         t_lo, t_note = area_lower_bound(pf, recipe)
     else:
@@ -239,8 +243,40 @@ def main(args):
     print(f"  {t_label:<18}: {format_bound(t_lo, t_hi)}")
 
 
+def _chapter_1_2_pids():
+    """Campaign chapters 1+2, in actual in-game mission order (not numeric ID order)."""
+    return [
+        "P007",  # Stabilized Water
+        "P010",  # Refined Gold
+        "P009",  # Face Powder
+        "P011",  # Waterproof Sealant
+        "P013",  # Hangover Cure
+        "P008",  # Airship Fuel
+        "P012",  # Precision Machine Oil
+        "P014",  # Health Tonic
+        "P015",  # Stamina Potion
+        "P016",  # Hair Product
+        "P019",  # Rocket Propellant
+        "P018",  # Mist of Incapacitation
+        "P017",  # Explosive Phial
+        "P020",  # Armor Filament
+        "P021",  # Courage Potion
+        "P022",  # Surrender Flare
+    ][5:]
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compute proven bounds for the optimal SUM solution.")
-    parser.add_argument("--puzzle", default="P007", metavar="ID", help="Puzzle ID (default: P007)")
+    parser.add_argument("--puzzle", default=None, metavar="ID",
+                         help="Puzzle ID (default: run every chapter 1+2 puzzle, P007-P022)")
     args = parser.parse_args()
-    main(args)
+
+    if args.puzzle is None:
+        for pid in _chapter_1_2_pids():
+            try:
+                main(argparse.Namespace(puzzle=pid))
+            except Exception as e:
+                print(f"Puzzle    : {pid} — skipped ({type(e).__name__}: {e})")
+            print()
+    else:
+        main(args)
