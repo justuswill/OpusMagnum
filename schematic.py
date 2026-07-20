@@ -21,13 +21,23 @@ A BFS from the initial state, following every neighbor, enumerates every
 combination of unbond/un-react moves reachable within the reaction budget —
 i.e. every structurally-distinct way the recipe's atom bookkeeping could
 have been assembled, without yet committing to geometry/cycle timing (still
-out of scope here, same as stoichiometry.py).
+out of scope here, same as stoichiometry.py) — with one exception: a third
+kind of move, "wait" (_wait_neighbors), ages every free atom below
+_READY_AGE by one, modeling the real idle cycles a drop-and-create
+reaction's product atom needs before it's old enough to be picked up again
+(see _READY_AGE / Atom.age) — everything else about the state is untouched.
 
-Termination: every move strictly decreases (total bonds across all
-molecules) + (total reactions_left) — unbond removes one bond (triple-bond
-reversal removes three at once) and never adds any; un-react spends one unit
-of budget and the atoms it adds are always unbonded. That sum is bounded
-below by 0, so the state graph is a finite DAG and the BFS always terminates.
+Termination: every unbond/un-react move strictly decreases (total bonds
+across all molecules) + (total reactions_left) — unbond removes one bond
+(triple-bond reversal removes three at once) and never adds any; un-react
+spends one unit of budget and the atoms it adds are always unbonded. "wait"
+is the one move that leaves that sum unchanged, but it strictly decreases a
+second, lexicographically-following measure — sum of (_READY_AGE - age)
+over every free atom below _READY_AGE — and is never offered at all once
+that's already zero (see _wait_neighbors), so the lexicographic pair
+(bonds+reactions_left, age deficit) still strictly decreases on every move,
+bounded below by (0, 0): the state graph is still a finite DAG and the BFS
+still always terminates.
 
 Simplifications (deliberately out of scope for this module):
   - An un-react move relabels its *first* consumed atom in place (keeping
@@ -108,7 +118,17 @@ class StateGraph:
         self.edges: Dict[int, List[int]] = {}
         self.edge_move: Dict[Tuple[int, int], str] = {}  # (from_idx, to_idx) -> move label
         self._index: Dict[tuple, int] = {}  # canonical signature -> index
-        self.input_state_idx: int = None  # set by reachable_states once the actual raw-reagent state is found
+        self.input_state_idx: int = None  # set by reachable_states: input_state_indices[0], kept for display
+        # Every state matching the actual raw reagents (see reachable_states)
+        # — molecule_signature (unlike _state_signature) doesn't look at
+        # Atom.age, so structurally-identical raw-reagent states can still
+        # end up as distinct graph nodes differing only in how much a free
+        # atom has "waited" (see _READY_AGE) along whichever path reached
+        # them. A genuine raw-reagent grab has no readiness requirement of
+        # its own, so bounds.py's path search must be free to start from
+        # *any* of them and take whichever gives the best result, not just
+        # the first one this BFS happened to discover.
+        self.input_state_indices: List[int] = []
 
     def add_state(self, state: State, key: tuple) -> int:
         idx = len(self.states)
@@ -129,12 +149,12 @@ class StateGraph:
 
     def __repr__(self):
         """One line per state: idx: state_str -> idx1[move1], idx2[move2],
-        ... — the state matching the actual raw reagents (see
-        input_state_idx) is marked idx* instead of idx."""
+        ... — every state matching the actual raw reagents (see
+        input_state_indices) is marked idx* instead of idx."""
         lines = []
         for idx, state in enumerate(self.states):
             targets = ", ".join(f"{t}[{self.edge_move[(idx, t)]}]" for t in self.edges[idx])
-            label = f"{idx}*" if idx == self.input_state_idx else f"{idx}"
+            label = f"{idx}*" if idx in self.input_state_indices else f"{idx}"
             lines.append(f"{label}: {state!r} -> {targets}")
         return "\n".join(lines)
 
@@ -283,8 +303,27 @@ def molecule_signature(mol: Molecule, rounds: int = 4) -> tuple:
     return tuple(sorted(colors))
 
 
-def _state_signature(state: State) -> tuple:
-    mol_sigs = tuple(sorted(molecule_signature(m) for m in state.molecules))
+def _state_signature(state: State, tracked_types: frozenset) -> tuple:
+    """Canonical BFS-dedup key for `state`. Distinct from molecule_signature
+    itself (used everywhere else — _matches_raw_reagents, bounds.py's
+    reagent matching): those callers need a free atom to match its puzzle
+    input regardless of how many "wait" moves it's absorbed (a genuine raw
+    reagent has no readiness requirement at all — see _READY_AGE), so age
+    only feeds into *this* signature, which exists purely to tell the BFS
+    apart two states that are one "wait" apart — since only one of them can
+    reverse a drop-and-create reaction (_firing_atoms_ok), they really are
+    distinct states with different onward moves, not duplicates to collapse.
+    Restricted to `tracked_types` (the actual product types of this puzzle's
+    drop-and-create reactions — see reachable_states) since age is never
+    even looked at for any other type: including it in their signature too
+    would only split otherwise-identical states apart for no reason,
+    multiplying the graph without changing what's reachable from it."""
+    mol_sigs = tuple(sorted(
+        (molecule_signature(m), min(m.atoms[0].age, _READY_AGE))
+        if len(m.atoms) == 1 and m.atoms[0].type in tracked_types
+        else (molecule_signature(m), -1)
+        for m in state.molecules
+    ))
     react_sig = tuple(sorted((k, v) for k, v in state.reactions_left.items() if v > 0))
     return (mol_sigs, react_sig)
 
@@ -401,6 +440,17 @@ def _elementary_bond_actions(state: State, parts_available: int) -> List[Tuple[s
     return actions
 
 
+def _freshly_freed(components: List[Molecule]) -> List[Molecule]:
+    """Force age=0 on every singleton among `components` — call this on the
+    result of splitting a molecule that had bonds (so definitely had >1
+    atom): any singleton coming out of that split just became free *this*
+    move, however old the atom was before (see _READY_AGE / Atom.age)."""
+    return [
+        replace(m, atoms=[replace(m.atoms[0], age=0)]) if len(m.atoms) == 1 else m
+        for m in components
+    ]
+
+
 def _apply_bond_removal(state: State, remove_by_mol: Dict[int, set]) -> List[Molecule]:
     """remove_by_mol maps molecule_idx -> set of (bond index, bit to clear)
     pairs (see _elementary_bond_actions) — clearing a bit only drops a bond
@@ -424,7 +474,7 @@ def _apply_bond_removal(state: State, remove_by_mol: Dict[int, set]) -> List[Mol
             new_type = b.type & ~bits
             if new_type:
                 new_bonds.append(replace(b, type=new_type))
-        new_molecules.extend(_split_molecule(mol.atoms, new_bonds))
+        new_molecules.extend(_freshly_freed(_split_molecule(mol.atoms, new_bonds)))
     return new_molecules
 
 
@@ -558,7 +608,7 @@ def _apply_mixed_actions(state: State, chosen: list) -> State:
     like a lone _reaction_neighbors firing; bond removals just drop bonds
     — see both for the individual rules this only combines."""
     bond_remove_by_mol: Dict[int, set] = {}
-    relabel_by_mol: Dict[int, Dict[int, int]] = {}
+    relabel_by_mol: Dict[int, Dict[int, tuple]] = {}  # ai -> (new_type, is_drop_and_create)
     extra_remove_by_mol: Dict[int, set] = {}
     spawn_types = []
     reaction_uses: Counter = Counter()
@@ -568,7 +618,7 @@ def _apply_mixed_actions(state: State, chosen: list) -> State:
             _, name, firing, add_types = payload
             reaction_uses[name] += 1
             r_mi, r_ai = firing[0]
-            relabel_by_mol.setdefault(r_mi, {})[r_ai] = add_types[0]
+            relabel_by_mol.setdefault(r_mi, {})[r_ai] = (add_types[0], _is_drop_and_create(name))
             for mi, ai in firing[1:]:
                 extra_remove_by_mol.setdefault(mi, set()).add(ai)
             spawn_types.extend(add_types[1:])
@@ -586,9 +636,12 @@ def _apply_mixed_actions(state: State, chosen: list) -> State:
             continue
 
         new_atoms = list(mol.atoms)
-        for ai, new_type in relabels.items():
+        for ai, (new_type, is_dc) in relabels.items():
             old = new_atoms[ai]
-            new_atoms[ai] = Atom(type=new_type, u=old.u, v=old.v)
+            # See _reaction_neighbors: a plain relabel carries the atom's
+            # age over (same atom, continuous existence); a drop-and-create
+            # reversal starts both sides fresh (genuine creation boundary).
+            new_atoms[ai] = Atom(type=new_type, u=old.u, v=old.v, age=0 if is_dc else old.age)
         # removed_bonds is a set of (bond index, bit to clear) pairs (see
         # _elementary_bond_actions) — clearing a bit only drops a bond
         # entry once its type reaches 0, so one color of a multi-color
@@ -607,12 +660,15 @@ def _apply_mixed_actions(state: State, chosen: list) -> State:
                 new_bonds.append(replace(b, type=new_type))
 
         if removed_atoms:
-            new_molecules.extend(_remove_atoms(new_atoms, new_bonds, removed_atoms))
+            result = _remove_atoms(new_atoms, new_bonds, removed_atoms)
         else:
-            new_molecules.extend(_split_molecule(new_atoms, new_bonds))
+            result = _split_molecule(new_atoms, new_bonds)
+        # See _reaction_neighbors: a singleton here is only "freshly freed"
+        # (age reset) if it wasn't already free-standing before this move.
+        new_molecules.extend(_freshly_freed(result) if len(mol.atoms) > 1 else result)
 
     for atype in spawn_types:
-        new_molecules.append(Molecule(atoms=[Atom(type=atype, u=0, v=0)], bonds=[]))
+        new_molecules.append(Molecule(atoms=[Atom(type=atype, u=0, v=0, age=0)], bonds=[]))
 
     new_reactions_left = dict(state.reactions_left)
     for name, uses in reaction_uses.items():
@@ -690,6 +746,18 @@ def _is_drop_and_create(name: str) -> bool:
     return name in _DROP_AND_CREATE or name.startswith(_DROP_AND_CREATE_PREFIXES)
 
 
+# A drop-and-create reaction's product atom(s) can't be immediately re-grabbed
+# for another drop-and-create firing the instant they appear — the glyph
+# drops its inputs, fires, and only *then* is the result there to be picked
+# back up, so a same-cycle re-use has nowhere to hide that pickup. If the
+# atom instead sits free for a couple of "wait" moves first (see
+# _wait_neighbors), that pickup overlaps with whatever else is happening
+# during that idle time and costs nothing extra. READY_AGE=2 matches the
+# rule: 0 the cycle it appears, 1 after one wait, 2 (ready) after two —
+# capped there since a longer wait changes nothing further.
+_READY_AGE = 2
+
+
 def _firing_atoms_ok(state: State, name: str, firing: List[Tuple[int, int]]) -> bool:
     """True if `firing`'s atoms satisfy this reaction's unbonded
     requirements. Most reactions (calcification, projection, duplication,
@@ -702,11 +770,16 @@ def _firing_atoms_ok(state: State, name: str, firing: List[Tuple[int, int]]) -> 
     every atom they consume and create fresh ones rather than transforming
     anything in place (there's no atom that "is" the output), so *all*
     their consumed atoms — not just the extras — must already be
-    free-standing. An unbonded atom is exactly one whose molecule has just
-    that 1 atom (state.molecules is always split into connected components
-    — see _split_molecule)."""
+    free-standing, *and* (see _READY_AGE) old enough to plausibly have sat
+    around since a genuine firing produced them. An unbonded atom is exactly
+    one whose molecule has just that 1 atom (state.molecules is always split
+    into connected components — see _split_molecule)."""
     check_from = 0 if _is_drop_and_create(name) else 1
-    return all(len(state.molecules[mi].atoms) == 1 for mi, _ai in firing[check_from:])
+    if not all(len(state.molecules[mi].atoms) == 1 for mi, _ai in firing[check_from:]):
+        return False
+    if _is_drop_and_create(name):
+        return all(state.molecules[mi].atoms[ai].age >= _READY_AGE for mi, ai in firing)
+    return True
 
 
 def _choose_instances(state: State, remove_types: List[int]):
@@ -788,6 +861,7 @@ def _reaction_neighbors(state: State, reactions: Dict[str, Reaction]) -> List[Tu
         r = reactions[name]
         remove_types, add_type_options = _reverse_reaction_options(r)
         group_size = len(remove_types)
+        is_dc = _is_drop_and_create(name)
         space_limited = _is_space_limited(name)
         occupied = _occupied_positions(state) if space_limited else None
         for add_types in add_type_options:
@@ -828,15 +902,28 @@ def _reaction_neighbors(state: State, reactions: Dict[str, Reaction]) -> List[Tu
                         new_atoms = list(mol.atoms)
                         for ai in relabel_ais:
                             old = new_atoms[ai]
-                            new_atoms[ai] = Atom(type=add_types[0], u=old.u, v=old.v)
+                            # A plain relabel is the same atom continuing to
+                            # exist (see _firing_atoms_ok) — its age carries
+                            # over. A drop-and-create reversal crosses a
+                            # genuine creation boundary (there's no atom that
+                            # "is" the output), so both sides start fresh.
+                            new_atoms[ai] = Atom(type=add_types[0], u=old.u, v=old.v,
+                                                  age=0 if is_dc else old.age)
                         if extra_remove:
-                            new_molecules.extend(_remove_atoms(new_atoms, mol.bonds, extra_remove))
+                            result = _remove_atoms(new_atoms, mol.bonds, extra_remove)
                         else:
-                            new_molecules.append(Molecule(atoms=new_atoms, bonds=list(mol.bonds)))
+                            result = [Molecule(atoms=new_atoms, bonds=list(mol.bonds))]
+                        # A singleton coming out of this is only "freshly
+                        # freed" (age reset, see _freshly_freed) if the atom
+                        # wasn't already free-standing before this move —
+                        # i.e. its original molecule had more than 1 atom.
+                        # Otherwise it's the len==1 relabel-in-place case
+                        # above, whose age decision already stands.
+                        new_molecules.extend(_freshly_freed(result) if len(mol.atoms) > 1 else result)
 
                     for _ in range(k):
                         for atype in add_types[1:]:
-                            new_molecules.append(Molecule(atoms=[Atom(type=atype, u=0, v=0)], bonds=[]))
+                            new_molecules.append(Molecule(atoms=[Atom(type=atype, u=0, v=0, age=0)], bonds=[]))
 
                     new_reactions_left = dict(state.reactions_left)
                     new_reactions_left[name] -= k
@@ -845,21 +932,57 @@ def _reaction_neighbors(state: State, reactions: Dict[str, Reaction]) -> List[Tu
     return neighbors_out
 
 
-def neighbors(state: State, reactions: Dict[str, Reaction], parts_available: int) -> List[Tuple[State, str]]:
+_MOVE_WAIT = "wait"
+
+
+def _wait_neighbors(state: State, tracked_types: frozenset) -> List[Tuple[State, str]]:
+    """One "wait" move: every free (single-atom-molecule) atom of a
+    `tracked_types` type (the actual product types of this puzzle's
+    drop-and-create reactions — see reachable_states) below _READY_AGE ages
+    by 1 (capped there), nothing else about the state changes. This is how
+    a drop-and-create reaction's product atom (or any atom freshly freed by
+    an unbond — see Atom.age) "matures" enough to be picked back up for
+    another drop-and-create firing (_firing_atoms_ok) — real idle cycles the
+    search has to actually spend, not a free pass. Restricted to
+    tracked_types since age is never checked for any other type — offering
+    a "wait" that only ages an irrelevant atom would just multiply the graph
+    for no reason (see _state_signature). Omitted entirely once nothing
+    would change (every tracked free atom already mature): an edge to the
+    identical state would be a self-loop, which would break the topological
+    order bounds.py's path search relies on and contradicts the module
+    docstring's termination argument (nothing it tracks would be
+    decreasing)."""
+    changed = False
+    new_molecules = []
+    for mol in state.molecules:
+        if len(mol.atoms) == 1 and mol.atoms[0].type in tracked_types and mol.atoms[0].age < _READY_AGE:
+            changed = True
+            new_molecules.append(replace(mol, atoms=[replace(mol.atoms[0], age=mol.atoms[0].age + 1)]))
+        else:
+            new_molecules.append(mol)
+    if not changed:
+        return []
+    return [(State(new_molecules, dict(state.reactions_left)), _MOVE_WAIT)]
+
+
+def neighbors(state: State, reactions: Dict[str, Reaction], parts_available: int,
+              tracked_types: frozenset) -> List[Tuple[State, str]]:
     """Every (predecessor state, move label) pair reachable from `state` by
     one unbond, one triple-bond (multi-bonder) reversal, any atom-disjoint
     combination of 2+ of those, one (or several simultaneous, see
-    _reaction_neighbors) un-react move, or an atom-disjoint combination of
+    _reaction_neighbors) un-react move, an atom-disjoint combination of
     bonding actions with reaction firings / different reactions with each
-    other (see _combined_bond_reaction_neighbors) — unbond/triple-bond moves
-    only apply if the puzzle actually grants that glyph. Move label is
-    "bond", "triple-bond", "NxLABEL" for N combined same-kind moves,
-    "label+label" for a mixed combination, or the reaction name."""
+    other (see _combined_bond_reaction_neighbors), or one "wait" (see
+    _wait_neighbors) — unbond/triple-bond moves only apply if the puzzle
+    actually grants that glyph. Move label is "bond", "triple-bond",
+    "NxLABEL" for N combined same-kind moves, "label+label" for a mixed
+    combination, "wait", or the reaction name."""
     return (_unbond_neighbors(state, parts_available)
             + _triple_unbond_neighbors(state, parts_available)
             + _combined_bond_neighbors(state, parts_available)
             + _reaction_neighbors(state, reactions)
-            + _combined_bond_reaction_neighbors(state, parts_available, reactions))
+            + _combined_bond_reaction_neighbors(state, parts_available, reactions)
+            + _wait_neighbors(state, tracked_types))
 
 
 # ── BFS ────────────────────────────────────────────────────────────────────
@@ -927,16 +1050,34 @@ def reachable_states(pf: PuzzleFile, recipe: RecipeResult) -> StateGraph:
     reachable from which."""
     reactions = {r.name: r for r in build_reactions(pf)}
     reactions.update(recipe.extra_reactions)
+    # Only these types ever have their age checked (_firing_atoms_ok, for
+    # reversing a drop-and-create reaction) or matter for the BFS's own
+    # dedup (_state_signature) — every other free atom's age tracking would
+    # just be dead weight multiplying the graph for nothing (see
+    # _wait_neighbors / _state_signature). Restricted to reactions this
+    # puzzle's own recipe actually fires (reaction_counts > 0), not every
+    # drop-and-create reaction build_reactions can construct from the parts
+    # available — e.g. Purification generates one purify_X per consecutive
+    # metal-chain pair regardless of whether this recipe's own chain needs
+    # all of them, and a puzzle without the Glyph of Animismus granted at
+    # all has no reachable way to ever fire (or reverse) it.
+    tracked_types = frozenset(
+        atype
+        for name, r in reactions.items()
+        if _is_drop_and_create(name) and recipe.reaction_counts.get(name, 0) > 0
+        for atype, d in r.delta.items()
+        if d > 0
+    )
     start = initial_state(pf, recipe)
-    start_key = _state_signature(start)
+    start_key = _state_signature(start, tracked_types)
 
     graph = StateGraph()
     start_idx = graph.add_state(start, start_key)
     queue = deque([(start, start_idx)])
     while queue:
         current, current_idx = queue.popleft()
-        for nxt, move in neighbors(current, reactions, pf.parts_available):
-            key = _state_signature(nxt)
+        for nxt, move in neighbors(current, reactions, pf.parts_available, tracked_types):
+            key = _state_signature(nxt, tracked_types)
             if key in graph._index:
                 nxt_idx = graph._index[key]
             else:
@@ -945,77 +1086,25 @@ def reachable_states(pf: PuzzleFile, recipe: RecipeResult) -> StateGraph:
             graph.add_edge(current_idx, nxt_idx, move)
 
     products_needed = pf.products_needed()
-    match_idx = next(
-        (i for i, s in enumerate(graph.states)
-         if _matches_raw_reagents(s, pf, recipe, products_needed, exact=True)),
-        None,
-    )
-    if match_idx is None:
-        match_idx = next(
-            (i for i, s in enumerate(graph.states) if _matches_raw_reagents(s, pf, recipe, products_needed)),
-            None,
-        )
-    assert match_idx is not None, (
+    # Every state matching (exact=True preferred, see _matches_raw_reagents),
+    # not just the first — molecule_signature ignores Atom.age, so the same
+    # structural raw-reagent state can show up as several distinct graph
+    # nodes differing only in how much "waiting" (_READY_AGE) a free atom
+    # happened to accumulate along whichever path found it. A raw-reagent
+    # grab itself has no readiness requirement, so bounds.py's path search
+    # needs every one of them available to start from, and picks whichever
+    # gives the best (smallest) result — not whichever this BFS discovered
+    # first, which could be an unnecessarily-waited one.
+    match_indices = [i for i, s in enumerate(graph.states)
+                      if _matches_raw_reagents(s, pf, recipe, products_needed, exact=True)]
+    if not match_indices:
+        match_indices = [i for i, s in enumerate(graph.states)
+                          if _matches_raw_reagents(s, pf, recipe, products_needed)]
+    assert match_indices, (
         f"{pf.name!r}: no reachable state matches the actual raw reagents — "
         "the un-react/unbond move rules failed to find a valid full "
         "decomposition path that solve_recipe already proved exists"
     )
-    graph.input_state_idx = match_idx
+    graph.input_state_indices = match_indices
+    graph.input_state_idx = match_indices[0]
     return graph
-
-
-def plot_state_graph(graph: StateGraph, out_path: str = "stategraph.png", max_label_len: int = 40) -> None:
-    """Render a StateGraph as a network diagram, saved to `out_path`.
-    Visualization-only — networkx/matplotlib are imported here rather than
-    at module level so the core BFS/solver path never needs them installed.
-    The goal state (index 0) and the matched raw-reagent state
-    (graph.input_state_idx) are highlighted; edges are labeled with their
-    move (bond/triple-bond/reaction name)."""
-    import textwrap
-    import matplotlib.pyplot as plt
-    import networkx as nx
-
-    G = nx.DiGraph()
-    for idx in range(len(graph.states)):
-        G.add_node(idx)
-    for from_idx, targets in graph.edges.items():
-        for to_idx in targets:
-            G.add_edge(from_idx, to_idx, label=graph.edge_move[(from_idx, to_idx)])
-
-    # DAG (output at 0, raw reagents at input_state_idx) — a top-down "dot"
-    # layout reads much better than force-directed spring layout if
-    # graphviz is available; falls back otherwise.
-    try:
-        pos = nx.nx_agraph.graphviz_layout(G, prog="dot")
-    except ImportError:
-        pos = nx.spring_layout(G, seed=0, k=0.9)
-
-    node_colors = []
-    for idx in G.nodes:
-        if idx == 0:
-            node_colors.append("#4C9F70")   # goal / output state
-        elif idx == graph.input_state_idx:
-            node_colors.append("#C9622D")   # raw-reagent state
-        else:
-            node_colors.append("#7C93C9")
-
-    def short_label(idx):
-        text = repr(graph.states[idx])
-        return "\n".join(textwrap.wrap(text, max_label_len)[:3])
-
-    labels = {idx: f"{idx}\n{short_label(idx)}" for idx in G.nodes}
-    edge_labels = {(u, v): d["label"] for u, v, d in G.edges(data=True)}
-
-    plt.figure(figsize=(max(12, len(G.nodes) * 0.6), max(8, len(G.nodes) * 0.4)))
-    nx.draw(
-        G, pos,
-        node_color=node_colors, node_size=1400, arrows=True,
-        arrowsize=12, edge_color="#999999", width=1.2,
-    )
-    nx.draw_networkx_labels(G, pos, labels=labels, font_size=6)
-    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=6)
-
-    plt.axis("off")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
-    plt.close()

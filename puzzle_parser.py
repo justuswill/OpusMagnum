@@ -80,6 +80,13 @@ class Atom:
     type: int
     u: int
     v: int
+    # Only meaningful for a free (unbonded, single-atom-molecule) instance in
+    # schematic.py's backward search: how many "wait" moves it's survived
+    # since it most recently became free (unbonded, or freshly spawned by
+    # reversing a reaction), capped at READY_AGE. Ignored everywhere else
+    # (parsing, bonded atoms, molecule_signature) — see schematic.py's
+    # _READY_AGE / _is_drop_and_create for what it gates.
+    age: int = 0
 
     @property
     def name(self):

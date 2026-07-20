@@ -239,11 +239,11 @@ def _prune_dominated_paths(paths: list, raw_ls_by_path: dict, reagent_sig: dict)
 
 
 def _pareto_paths_raw_ls(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph) -> list:
-    """Every Pareto-optimal path from graph.input_state_idx to the output
-    (node 0), each paired with its already-computed raw_L values — a single
-    BFS/DP that prunes dominated partial paths as it goes, instead of
-    enumerating every path first (potentially exponential — see
-    _all_paths_nodes) and only pruning afterward (see
+    """Every Pareto-optimal path from any of graph.input_state_indices to
+    the output (node 0), each paired with its already-computed raw_L
+    values — a single BFS/DP that prunes dominated partial paths as it
+    goes, instead of enumerating every path first (potentially exponential
+    — see _all_paths_nodes) and only pruning afterward (see
     _prune_dominated_paths) once every path's already been walked a second
     time for its raw_L values (see _path_raw_ls). Kept alongside that older
     trio (now unused, left in place rather than deleted) in case this
@@ -257,17 +257,28 @@ def _pareto_paths_raw_ls(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph
     forward steps remain from this event to the output" — and "how many
     forward steps remain to the output" is exactly the walk's *backward*
     distance j from node 0 so far, needing no knowledge of D (the eventual
-    total path length, only known once the walk reaches
-    graph.input_state_idx) at all. So each consumption event gets its
+    total path length, only known once the walk reaches one of
+    graph.input_state_indices) at all. So each consumption event gets its
     final raw_L the moment it's discovered, no deferred shift needed.
 
     Domination (a partial path's raw_L-so-far componentwise <= another's,
     per reagent type) is still safe to prune on early exactly as
     _prune_dominated_paths reasons for complete paths: both partial paths
     sit at the same node, so they share every possible remaining suffix,
-    and appending the identical suffix to both preserves the <=."""
+    and appending the identical suffix to both preserves the <=.
+
+    graph.input_state_indices can hold more than one node — molecule_signature
+    (unlike the _state_signature used to dedup the graph itself) ignores
+    Atom.age, so the same structural raw-reagent composition can show up as
+    several distinct nodes differing only in how much a free atom happened
+    to "wait" (see schematic._READY_AGE) along whichever path found it. A
+    genuine raw-reagent grab has no readiness requirement, so every one of
+    them is a legitimate place to start from — collecting results from all
+    of them and letting the usual take-the-minimum logic in _cadence_latency
+    sort out which is best is what actually avoids charging for an
+    unnecessary wait that a different, equally valid start node didn't need."""
     reagent_sig = _reagent_sig(pf, recipe)
-    start, goal = graph.input_state_idx, 0
+    starts, goal = graph.input_state_indices, 0
 
     counts_cache = {}
 
@@ -340,8 +351,9 @@ def _pareto_paths_raw_ls(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph
                 bucket[:] = survivors
 
     results = []
-    for profile, path, _j in profiles.get(start, []):
-        results.append((list(reversed(path)), profile))
+    for start in starts:
+        for profile, path, _j in profiles.get(start, []):
+            results.append((list(reversed(path)), profile))
     return results
 
 
