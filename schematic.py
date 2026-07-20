@@ -59,13 +59,14 @@ Simplifications (deliberately out of scope for this module):
 """
 
 from collections import Counter, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import combinations, product as iproduct
 from typing import Dict, List, Tuple
 
 from puzzle_parser import (
     PuzzleFile, Molecule, Atom, Bond, ATOM_NAMES,
     PART_BONDER, PART_BONDER_PRISMA, PART_BONDER_SPEED,
+    BOND_NORMAL, BOND_TRIPLEX_R, BOND_TRIPLEX_K, BOND_TRIPLEX_Y,
 )
 from stoichiometry import RecipeResult, Reaction, build_reactions
 
@@ -296,11 +297,15 @@ def _state_signature(state: State) -> tuple:
 # bond preferred over triple-bond, per instruction; reaction moves default
 # to the middle since no preference was specified for them.
 _MOVE_BOND = "bond"
+_MOVE_BOND_R = "bond_r"
+_MOVE_BOND_K = "bond_k"
+_MOVE_BOND_Y = "bond_y"
 _MOVE_TRIPLE_BOND = "triple-bond"
+_TRIPLEX_COLOR_LABEL = {BOND_TRIPLEX_R: _MOVE_BOND_R, BOND_TRIPLEX_K: _MOVE_BOND_K, BOND_TRIPLEX_Y: _MOVE_BOND_Y}
 
 
 def _move_priority(move: str) -> int:
-    if move == _MOVE_BOND:
+    if move in (_MOVE_BOND, _MOVE_BOND_R, _MOVE_BOND_K, _MOVE_BOND_Y):
         return 0
     if move == _MOVE_TRIPLE_BOND:
         return 2
@@ -337,31 +342,41 @@ _TRIPLE_DIRECTION_SETS = [(0, 2, 4), (1, 3, 5)]
 
 def _elementary_bond_actions(state: State, parts_available: int) -> List[Tuple[str, frozenset, Dict[int, set]]]:
     """Every individual bonding action currently reversible in `state`: one
-    single-bond removal (reverse of a Bonder/Bonder-Prisma — needs
-    PART_BONDER for normal bonds, PART_BONDER_PRISMA for triplex, gated per
-    bond kind), or one triple-bond removal (reverse of a Multi-bonder, needs
-    PART_BONDER_SPEED — 2 or 3 bonds around one atom, whichever of a
-    qualifying triple's slots are occupied; only ever normal bonds).
+    single-bond removal (reverse of a Bonder — needs PART_BONDER, normal
+    bonds only, label "bond"), or one single-*color* triplex removal
+    (reverse of one Bonder-Prisma pass — needs PART_BONDER_PRISMA, label
+    "bond_r"/"bond_k"/"bond_y"): a bond with 2-3 triplex colors set needs
+    that many separate actions, one color at a time — you can't strip a
+    full triplex bond in one move, only one color per pass. Or one
+    triple-bond removal (reverse of a Multi-bonder, needs PART_BONDER_SPEED
+    — 2 or 3 bonds around one atom, whichever of a qualifying triple's
+    slots are occupied; only ever normal bonds).
 
     Each action is (move_label, touched_atoms, remove_by_mol):
     touched_atoms is the set of (molecule_idx, atom_idx) pairs the action
     grabs — used to check that two actions combined into one move never
     share an atom (an atom can only be part of one bonding action at a
-    time); remove_by_mol maps molecule_idx -> set of bond indices (into
-    that molecule's bonds list) the action removes."""
+    time — this is also exactly why two different colors of the *same*
+    triplex bond can never combine into one move: they touch the same pair
+    of atoms). remove_by_mol maps molecule_idx -> set of (bond index into
+    that molecule's bonds list, bit to clear from that bond's type) pairs
+    the action removes — clearing a bit only drops the bond entry entirely
+    once its type reaches 0 (see _apply_bond_removal)."""
     actions = []
     for mi, mol in enumerate(state.molecules):
         pos_to_index = {(a.u, a.v): i for i, a in enumerate(mol.atoms)}
         for bi, b in enumerate(mol.bonds):
-            if b.is_normal and not (parts_available & PART_BONDER):
-                continue
-            if b.is_triplex and not (parts_available & PART_BONDER_PRISMA):
-                continue
             ai = pos_to_index.get((b.from_u, b.from_v))
             aj = pos_to_index.get((b.to_u, b.to_v))
             if ai is None or aj is None:
                 continue
-            actions.append((_MOVE_BOND, frozenset({(mi, ai), (mi, aj)}), {mi: {bi}}))
+            touched = frozenset({(mi, ai), (mi, aj)})
+            if b.is_normal and (parts_available & PART_BONDER):
+                actions.append((_MOVE_BOND, touched, {mi: {(bi, BOND_NORMAL)}}))
+            if parts_available & PART_BONDER_PRISMA:
+                for color, label in _TRIPLEX_COLOR_LABEL.items():
+                    if b.type & color:
+                        actions.append((label, touched, {mi: {(bi, color)}}))
 
         if parts_available & PART_BONDER_SPEED:
             by_dir = _bonds_by_direction(mol.atoms, mol.bonds)
@@ -381,26 +396,47 @@ def _elementary_bond_actions(state: State, parts_available: int) -> List[Tuple[s
                         neighbor_ai = pos_to_index.get(neighbor_pos)
                         if neighbor_ai is not None:
                             touched.add((mi, neighbor_ai))
-                    actions.append((_MOVE_TRIPLE_BOND, frozenset(touched), {mi: set(bond_indices)}))
+                    actions.append((_MOVE_TRIPLE_BOND, frozenset(touched),
+                                     {mi: {(k, BOND_NORMAL) for k in bond_indices}}))
     return actions
 
 
 def _apply_bond_removal(state: State, remove_by_mol: Dict[int, set]) -> List[Molecule]:
+    """remove_by_mol maps molecule_idx -> set of (bond index, bit to clear)
+    pairs (see _elementary_bond_actions) — clearing a bit only drops a bond
+    entry entirely once its type reaches 0, so removing one color from a
+    multi-color triplex bond leaves the other colors' connection intact."""
     new_molecules = []
     for mi, mol in enumerate(state.molecules):
-        if mi in remove_by_mol:
-            new_bonds = [b for k, b in enumerate(mol.bonds) if k not in remove_by_mol[mi]]
-            new_molecules.extend(_split_molecule(mol.atoms, new_bonds))
-        else:
+        removals = remove_by_mol.get(mi)
+        if not removals:
             new_molecules.append(mol)
+            continue
+        clear_bits: Dict[int, int] = {}
+        for bi, bit in removals:
+            clear_bits[bi] = clear_bits.get(bi, 0) | bit
+        new_bonds = []
+        for bi, b in enumerate(mol.bonds):
+            bits = clear_bits.get(bi, 0)
+            if not bits:
+                new_bonds.append(b)
+                continue
+            new_type = b.type & ~bits
+            if new_type:
+                new_bonds.append(replace(b, type=new_type))
+        new_molecules.extend(_split_molecule(mol.atoms, new_bonds))
     return new_molecules
 
 
+_SINGLE_BOND_MOVES = {_MOVE_BOND, _MOVE_BOND_R, _MOVE_BOND_K, _MOVE_BOND_Y}
+
+
 def _unbond_neighbors(state: State, parts_available: int) -> List[Tuple[State, str]]:
-    """One single-bond removal at a time — see _elementary_bond_actions."""
+    """One single-bond removal (normal, or one triplex color) at a time —
+    see _elementary_bond_actions."""
     return [(State(_apply_bond_removal(state, remove_by_mol), dict(state.reactions_left)), label)
             for label, _touched, remove_by_mol in _elementary_bond_actions(state, parts_available)
-            if label == _MOVE_BOND]
+            if label in _SINGLE_BOND_MOVES]
 
 
 def _triple_unbond_neighbors(state: State, parts_available: int) -> List[Tuple[State, str]]:
@@ -465,6 +501,178 @@ def _reverse_reaction_atoms(r: Reaction) -> Tuple[List[int], List[int]]:
     return remove_types, add_types
 
 
+def _reverse_reaction_options(r: Reaction) -> Tuple[List[int], List[List[int]]]:
+    """(remove_types, add_type_options) — like _reverse_reaction_atoms, but
+    add_type_options is a list of alternatives for what the relabeled first
+    atom can become. Normally just one option (the reaction's own fixed
+    delta, unchanged from _reverse_reaction_atoms); a combined
+    "calcify_X_or_Y" synthetic reaction (r.alt_reagent set — see
+    stoichiometry.solve_recipe_combined) has no single fixed reagent-side
+    atom, so one option per alternative type, all sharing the same
+    reaction's budget — the caller tries each as a separate candidate
+    move."""
+    remove_types, add_types = _reverse_reaction_atoms(r)
+    if not r.alt_reagent:
+        return remove_types, [add_types]
+    return remove_types, [[alt] for alt in r.alt_reagent]
+
+
+def _elementary_reaction_actions(state: State, reactions: Dict[str, Reaction]) -> List[Tuple[str, frozenset, tuple]]:
+    """Every single un-react firing (one reaction, one specific choice of
+    atom instances, one choice of which alternative type to relabel to if
+    the reaction is a combined "X_or_Y" one — see _reverse_reaction_options)
+    currently available, in the same (label, touched_atoms, payload) shape
+    _elementary_bond_actions uses so both can feed the same atom-disjoint
+    combiner (see _combined_bond_reaction_neighbors) — payload is
+    ("reaction", name, chosen, add_types) instead of a bond-removal dict.
+    Only k=1 firings: batching several firings of the *same* reaction
+    together is still _reaction_neighbors' own job (it composes with itself
+    more directly); this exists so a firing can combine with bonds or with
+    a *different* reaction, which neither existing path can produce."""
+    actions = []
+    for name, budget in state.reactions_left.items():
+        if budget <= 0:
+            continue
+        r = reactions[name]
+        remove_types, add_type_options = _reverse_reaction_options(r)
+        for add_types in add_type_options:
+            # See _reaction_neighbors: a combined "X_or_Y" reaction's move
+            # label should show which concrete alternative this action
+            # actually used, not the umbrella group name.
+            display_name = f"calcify_{ATOM_NAMES[add_types[0]]}" if r.alt_reagent else name
+            for chosen in _choose_instances(state, remove_types):
+                if not _firing_atoms_ok(state, name, chosen):
+                    continue
+                actions.append((display_name, frozenset(chosen), ("reaction", name, chosen, add_types)))
+    return actions
+
+
+def _apply_mixed_actions(state: State, chosen: list) -> State:
+    """Apply a combo of atom-disjoint elementary actions — some bonding
+    actions (payload: {mol_idx: {(bond index, bit to clear), ...}}, from
+    _elementary_bond_actions), some reaction firings (payload: ("reaction",
+    name, firing, add_types), from _elementary_reaction_actions, add_types
+    already resolved to whichever alternative that action picked — see
+    _reverse_reaction_options) — simultaneously. Each firing relabels its
+    own first consumed atom in place and removes/spawns the rest, exactly
+    like a lone _reaction_neighbors firing; bond removals just drop bonds
+    — see both for the individual rules this only combines."""
+    bond_remove_by_mol: Dict[int, set] = {}
+    relabel_by_mol: Dict[int, Dict[int, int]] = {}
+    extra_remove_by_mol: Dict[int, set] = {}
+    spawn_types = []
+    reaction_uses: Counter = Counter()
+
+    for _label, _touched, payload in chosen:
+        if isinstance(payload, tuple) and payload[0] == "reaction":
+            _, name, firing, add_types = payload
+            reaction_uses[name] += 1
+            r_mi, r_ai = firing[0]
+            relabel_by_mol.setdefault(r_mi, {})[r_ai] = add_types[0]
+            for mi, ai in firing[1:]:
+                extra_remove_by_mol.setdefault(mi, set()).add(ai)
+            spawn_types.extend(add_types[1:])
+        else:
+            for mi, bis in payload.items():
+                bond_remove_by_mol.setdefault(mi, set()).update(bis)
+
+    new_molecules = []
+    for mi, mol in enumerate(state.molecules):
+        relabels = relabel_by_mol.get(mi, {})
+        removed_bonds = bond_remove_by_mol.get(mi, set())
+        removed_atoms = extra_remove_by_mol.get(mi, set())
+        if not relabels and not removed_bonds and not removed_atoms:
+            new_molecules.append(mol)
+            continue
+
+        new_atoms = list(mol.atoms)
+        for ai, new_type in relabels.items():
+            old = new_atoms[ai]
+            new_atoms[ai] = Atom(type=new_type, u=old.u, v=old.v)
+        # removed_bonds is a set of (bond index, bit to clear) pairs (see
+        # _elementary_bond_actions) — clearing a bit only drops a bond
+        # entry once its type reaches 0, so one color of a multi-color
+        # triplex bond can be removed while the others stay intact.
+        clear_bits: Dict[int, int] = {}
+        for bi, bit in removed_bonds:
+            clear_bits[bi] = clear_bits.get(bi, 0) | bit
+        new_bonds = []
+        for bi, b in enumerate(mol.bonds):
+            bits = clear_bits.get(bi, 0)
+            if not bits:
+                new_bonds.append(b)
+                continue
+            new_type = b.type & ~bits
+            if new_type:
+                new_bonds.append(replace(b, type=new_type))
+
+        if removed_atoms:
+            new_molecules.extend(_remove_atoms(new_atoms, new_bonds, removed_atoms))
+        else:
+            new_molecules.extend(_split_molecule(new_atoms, new_bonds))
+
+    for atype in spawn_types:
+        new_molecules.append(Molecule(atoms=[Atom(type=atype, u=0, v=0)], bonds=[]))
+
+    new_reactions_left = dict(state.reactions_left)
+    for name, uses in reaction_uses.items():
+        new_reactions_left[name] -= uses
+
+    return State(new_molecules, new_reactions_left)
+
+
+def _combined_bond_reaction_neighbors(state: State, parts_available: int,
+                                       reactions: Dict[str, Reaction]) -> List[Tuple[State, str]]:
+    """Atom-disjoint combos that mix bonding actions with reaction firings
+    (or different reactions with each other) into one simultaneous move —
+    the gap _combined_bond_neighbors (bonds only) and _reaction_neighbors
+    (same-reaction-name firings only) leave: an atom can be part of at most
+    one bonding action or one reaction firing per move, but nothing stops
+    unrelated glyphs elsewhere in the molecule from firing in the same
+    cycle. Restricted to combos containing at least one reaction firing —
+    all-bond combos are already _combined_bond_neighbors' job. Projection
+    firings additionally need a free hex each (_is_space_limited) — several
+    can still combine, just only as many as there are distinct free hexes
+    to put results in."""
+    bond_actions = _elementary_bond_actions(state, parts_available)
+    reaction_actions = _elementary_reaction_actions(state, reactions)
+    all_actions = bond_actions + reaction_actions
+    n = len(all_actions)
+    reaction_indices = set(range(len(bond_actions), n))
+    occupied = _occupied_positions(state)
+
+    neighbors_out = []
+    for size in range(2, n + 1):
+        for combo in combinations(range(n), size):
+            if reaction_indices.isdisjoint(combo):
+                continue  # pure-bond combo, already covered by _combined_bond_neighbors
+            touched_union = set()
+            disjoint = True
+            for idx in combo:
+                touched = all_actions[idx][1]
+                if touched & touched_union:
+                    disjoint = False
+                    break
+                touched_union |= touched
+            if not disjoint:
+                continue
+
+            space_anchors = []
+            for idx in combo:
+                label, _touched, payload = all_actions[idx]
+                if isinstance(payload, tuple) and payload[0] == "reaction" and _is_space_limited(payload[1]):
+                    mi, ai = payload[2][0]
+                    space_anchors.append((state.molecules[mi].atoms[ai].u, state.molecules[mi].atoms[ai].v))
+            if space_anchors and not _has_distinct_free_hexes(space_anchors, occupied):
+                continue
+
+            chosen = [all_actions[idx] for idx in combo]
+            labels = [all_actions[idx][0] for idx in combo]
+            move = f"{size}x{labels[0]}" if all(l == labels[0] for l in labels) else "+".join(labels)
+            neighbors_out.append((_apply_mixed_actions(state, chosen), move))
+    return neighbors_out
+
+
 def _atom_instances_by_type(state: State) -> Dict[int, List[Tuple[int, int]]]:
     """atom type -> list of (molecule index, atom index) instances."""
     by_type: Dict[int, List[Tuple[int, int]]] = {}
@@ -472,6 +680,33 @@ def _atom_instances_by_type(state: State) -> Dict[int, List[Tuple[int, int]]]:
         for ai, a in enumerate(mol.atoms):
             by_type.setdefault(a.type, []).append((mi, ai))
     return by_type
+
+
+_DROP_AND_CREATE = {"animismus", "dispersion", "unification"}
+_DROP_AND_CREATE_PREFIXES = ("purify_",)
+
+
+def _is_drop_and_create(name: str) -> bool:
+    return name in _DROP_AND_CREATE or name.startswith(_DROP_AND_CREATE_PREFIXES)
+
+
+def _firing_atoms_ok(state: State, name: str, firing: List[Tuple[int, int]]) -> bool:
+    """True if `firing`'s atoms satisfy this reaction's unbonded
+    requirements. Most reactions (calcification, projection, duplication,
+    rejection, proliferation) relabel their first consumed atom in place,
+    keeping its position *and bonds* — a transformation glyph applied to an
+    atom already part of a molecule — so only the extras beyond index 0
+    (separate co-reagents fed in from outside, e.g. projection's
+    quicksilver or rejection's 2nd atom) need to be free-standing.
+    animismus/dispersion/unification/purification are different: they drop
+    every atom they consume and create fresh ones rather than transforming
+    anything in place (there's no atom that "is" the output), so *all*
+    their consumed atoms — not just the extras — must already be
+    free-standing. An unbonded atom is exactly one whose molecule has just
+    that 1 atom (state.molecules is always split into connected components
+    — see _split_molecule)."""
+    check_from = 0 if _is_drop_and_create(name) else 1
+    return all(len(state.molecules[mi].atoms) == 1 for mi, _ai in firing[check_from:])
 
 
 def _choose_instances(state: State, remove_types: List[int]):
@@ -489,13 +724,58 @@ def _choose_instances(state: State, remove_types: List[int]):
         yield [inst for group in combo for inst in group]
 
 
+def _is_space_limited(name: str) -> bool:
+    """Projection needs its quicksilver atom *and* a free hex next to the
+    atom it's projecting, to put the result in — that hex can't be shared
+    by two simultaneous firings, unlike e.g. calcification's plain in-place
+    relabel. See _free_neighbor_positions / _has_distinct_free_hexes: the
+    relabeled atom's own position is real, tracked board geometry (not an
+    abstracted-away detail — see module docstring's Simplifications section
+    on why only *its* position is real, not any second/third atom a
+    multi-atom reaction also needs), so this can actually be checked rather
+    than assumed unlimited."""
+    return name.startswith("project_")
+
+
+def _occupied_positions(state: State) -> set:
+    return {(a.u, a.v) for mol in state.molecules for a in mol.atoms}
+
+
+def _free_neighbor_positions(pos: Tuple[int, int], occupied: set) -> List[Tuple[int, int]]:
+    u, v = pos
+    return [(u + du, v + dv) for du, dv in _HEX_DIRS if (u + du, v + dv) not in occupied]
+
+
+def _has_distinct_free_hexes(anchors: List[Tuple[int, int]], occupied: set) -> bool:
+    """True if every anchor position can be assigned its own distinct free
+    (unoccupied) hex neighbor to place a simultaneous projection's result in
+    — a small bipartite matching (Kuhn's algorithm; anchor counts here are
+    always tiny) since two anchors can share a candidate free hex but not
+    both actually use it."""
+    candidates = [_free_neighbor_positions(a, occupied) for a in anchors]
+    match_to_anchor: Dict[Tuple[int, int], int] = {}
+
+    def try_assign(i, seen):
+        for pos in candidates[i]:
+            if pos in seen:
+                continue
+            seen.add(pos)
+            if pos not in match_to_anchor or try_assign(match_to_anchor[pos], seen):
+                match_to_anchor[pos] = i
+                return True
+        return False
+
+    return all(try_assign(i, set()) for i in range(len(anchors)))
+
+
 def _reaction_neighbors(state: State, reactions: Dict[str, Reaction]) -> List[Tuple[State, str]]:
     """Reverses 1 up to `budget` firings of a reaction *simultaneously*, in
-    one combined move — this module doesn't track real glyph footprints or
-    positions at all (out of scope, see module docstring), so nothing here
-    distinguishes "one small glyph, applied many times" from "many firings
-    at once"; there's no structural reason to force firings to happen one at
-    a time. Each of the k firings gets its own independent application of
+    one combined move. The relabeled atom's own position is real, tracked
+    board geometry (see module docstring), so nothing stops several
+    same-named firings at once *except* projection, which additionally
+    needs its own free adjacent hex per firing (_is_space_limited) —
+    everything else has no structural reason to force firings to happen one
+    at a time. Each of the k firings gets its own independent application of
     the same relabel-in-place rule (its own first consumed atom keeps its
     own position/bonds and becomes the first produced type; only its own
     additional atoms, beyond the first, are removed/spawned fresh) — firings
@@ -506,76 +786,138 @@ def _reaction_neighbors(state: State, reactions: Dict[str, Reaction]) -> List[Tu
         if budget <= 0:
             continue
         r = reactions[name]
-        remove_types, add_types = _reverse_reaction_atoms(r)
+        remove_types, add_type_options = _reverse_reaction_options(r)
         group_size = len(remove_types)
-        for k in range(1, budget + 1):
-            for chosen in _choose_instances(state, remove_types * k):
-                firings = [chosen[i * group_size:(i + 1) * group_size] for i in range(k)]
+        space_limited = _is_space_limited(name)
+        occupied = _occupied_positions(state) if space_limited else None
+        for add_types in add_type_options:
+            # A combined "X_or_Y" reaction's move label should show which
+            # concrete alternative this specific move actually used, not
+            # the umbrella group name — e.g. "calcify_water", not
+            # "calcify_fire_or_water" — since that's what a real solution
+            # would actually be doing at this step.
+            display_name = f"calcify_{ATOM_NAMES[add_types[0]]}" if r.alt_reagent else name
+            for k in range(1, budget + 1):
+                for chosen in _choose_instances(state, remove_types * k):
+                    firings = [chosen[i * group_size:(i + 1) * group_size] for i in range(k)]
 
-                relabel_by_mol: Dict[int, set] = {}
-                remove_by_mol: Dict[int, set] = {}
-                for firing in firings:
-                    r_mi, r_ai = firing[0]
-                    relabel_by_mol.setdefault(r_mi, set()).add(r_ai)
-                    for mi, ai in firing[1:]:
-                        remove_by_mol.setdefault(mi, set()).add(ai)
-
-                new_molecules = []
-                for mi, mol in enumerate(state.molecules):
-                    relabel_ais = relabel_by_mol.get(mi, set())
-                    extra_remove = remove_by_mol.get(mi, set())
-                    if not relabel_ais and not extra_remove:
-                        new_molecules.append(mol)
+                    if not all(_firing_atoms_ok(state, name, firing) for firing in firings):
                         continue
-                    new_atoms = list(mol.atoms)
-                    for ai in relabel_ais:
-                        old = new_atoms[ai]
-                        new_atoms[ai] = Atom(type=add_types[0], u=old.u, v=old.v)
-                    if extra_remove:
-                        new_molecules.extend(_remove_atoms(new_atoms, mol.bonds, extra_remove))
-                    else:
-                        new_molecules.append(Molecule(atoms=new_atoms, bonds=list(mol.bonds)))
 
-                for _ in range(k):
-                    for atype in add_types[1:]:
-                        new_molecules.append(Molecule(atoms=[Atom(type=atype, u=0, v=0)], bonds=[]))
+                    if space_limited:
+                        anchors = [(state.molecules[mi].atoms[ai].u, state.molecules[mi].atoms[ai].v)
+                                   for mi, ai in (firing[0] for firing in firings)]
+                        if not _has_distinct_free_hexes(anchors, occupied):
+                            continue
 
-                new_reactions_left = dict(state.reactions_left)
-                new_reactions_left[name] -= k
-                label = f"{k}x{name}" if k > 1 else name
-                neighbors_out.append((State(new_molecules, new_reactions_left), label))
+                    relabel_by_mol: Dict[int, set] = {}
+                    remove_by_mol: Dict[int, set] = {}
+                    for firing in firings:
+                        r_mi, r_ai = firing[0]
+                        relabel_by_mol.setdefault(r_mi, set()).add(r_ai)
+                        for mi, ai in firing[1:]:
+                            remove_by_mol.setdefault(mi, set()).add(ai)
+
+                    new_molecules = []
+                    for mi, mol in enumerate(state.molecules):
+                        relabel_ais = relabel_by_mol.get(mi, set())
+                        extra_remove = remove_by_mol.get(mi, set())
+                        if not relabel_ais and not extra_remove:
+                            new_molecules.append(mol)
+                            continue
+                        new_atoms = list(mol.atoms)
+                        for ai in relabel_ais:
+                            old = new_atoms[ai]
+                            new_atoms[ai] = Atom(type=add_types[0], u=old.u, v=old.v)
+                        if extra_remove:
+                            new_molecules.extend(_remove_atoms(new_atoms, mol.bonds, extra_remove))
+                        else:
+                            new_molecules.append(Molecule(atoms=new_atoms, bonds=list(mol.bonds)))
+
+                    for _ in range(k):
+                        for atype in add_types[1:]:
+                            new_molecules.append(Molecule(atoms=[Atom(type=atype, u=0, v=0)], bonds=[]))
+
+                    new_reactions_left = dict(state.reactions_left)
+                    new_reactions_left[name] -= k
+                    label = f"{k}x{display_name}" if k > 1 else display_name
+                    neighbors_out.append((State(new_molecules, new_reactions_left), label))
     return neighbors_out
 
 
 def neighbors(state: State, reactions: Dict[str, Reaction], parts_available: int) -> List[Tuple[State, str]]:
     """Every (predecessor state, move label) pair reachable from `state` by
     one unbond, one triple-bond (multi-bonder) reversal, any atom-disjoint
-    combination of 2+ of those, or one (or several simultaneous, see
-    _reaction_neighbors) un-react move — unbond/triple-bond moves only apply
-    if the puzzle actually grants that glyph. Move label is "bond",
-    "triple-bond", "NxLABEL" for N combined same-kind moves, "label+label"
-    for a mixed combination, or the reaction name."""
+    combination of 2+ of those, one (or several simultaneous, see
+    _reaction_neighbors) un-react move, or an atom-disjoint combination of
+    bonding actions with reaction firings / different reactions with each
+    other (see _combined_bond_reaction_neighbors) — unbond/triple-bond moves
+    only apply if the puzzle actually grants that glyph. Move label is
+    "bond", "triple-bond", "NxLABEL" for N combined same-kind moves,
+    "label+label" for a mixed combination, or the reaction name."""
     return (_unbond_neighbors(state, parts_available)
             + _triple_unbond_neighbors(state, parts_available)
             + _combined_bond_neighbors(state, parts_available)
-            + _reaction_neighbors(state, reactions))
+            + _reaction_neighbors(state, reactions)
+            + _combined_bond_reaction_neighbors(state, parts_available, reactions))
 
 
 # ── BFS ────────────────────────────────────────────────────────────────────
 
-def _inputs_state_key(pf: PuzzleFile, recipe: RecipeResult) -> tuple:
-    """Canonical signature of the state matching the puzzle's actual raw
-    reagent molecules (one unit copy each, per recipe.reagent_counts //
-    products_needed, all reactions spent) — same signature function the BFS
-    indexes by, so membership is an O(1) dict lookup."""
-    products_needed = pf.products_needed()
-    goal_molecules = []
+def _matches_raw_reagents(state: State, pf: PuzzleFile, recipe: RecipeResult, products_needed: int,
+                           exact: bool = False) -> bool:
+    """True if `state` is exactly the puzzle's raw reagents, one unit copy
+    each (per recipe.reagent_counts // products_needed). For a reagent
+    covered by a combined reaction group (recipe.extra_reactions, see
+    solve_recipe_combined), exact=False (the default) accepts ANY split of
+    single-atom molecules among the group's alternative types as long as
+    their combined count matches the group's total — some split has to be
+    accepted, since solve_recipe's own one arbitrary split may not even be
+    reachable — but bounds.py's L_spine computation still keys off
+    recipe.reagent_counts per individual type, so reachable_states actually
+    wants exact=True first (matching recipe.reagent_counts's specific
+    per-type numbers precisely, when some reachable state realizes them)
+    and only falls back to this looser exact=False match if no state does.
+    A linear scan rather than a signature dict-lookup — reachable_states
+    only needs this once, over however many states the BFS found."""
+    combined_types = {t for r in recipe.extra_reactions.values() for t in (r.alt_reagent or [])}
+
+    def is_combined_atom(mol):
+        atoms = mol.atom_type_counts()
+        return len(atoms) == 1 and not mol.bonds and next(iter(atoms)) in combined_types
+
+    expected = Counter()
     for i, count in recipe.reagent_counts.items():
-        unit_count = count // products_needed
         mol = pf.inputs[i]
-        for _ in range(unit_count):
-            goal_molecules.append(Molecule(atoms=list(mol.atoms), bonds=list(mol.bonds)))
-    return _state_signature(State(goal_molecules, {}))
+        if is_combined_atom(mol) and not exact:
+            continue  # covered by combined_total instead of an exact per-reagent count
+        expected[molecule_signature(mol)] += count // products_needed
+
+    # A "raw, directly-needed-by-the-output" atom of a combined type and a
+    # "calcification feedstock" atom of that same type are structurally
+    # identical once fully decomposed — both end up as one standalone
+    # unbonded atom. So the aggregate (exact=False) target isn't the
+    # reaction's count (only the calcified portion), it's the *reagent*
+    # total across the whole group (raw + feedstock together).
+    combined_total = None
+    if not exact:
+        combined_total = sum(count // products_needed for i, count in recipe.reagent_counts.items()
+                              if is_combined_atom(pf.inputs[i]))
+
+    remaining = Counter(expected)
+    combined_found = 0
+    for mol in state.molecules:
+        if is_combined_atom(mol) and not exact:
+            combined_found += 1
+            continue
+        sig = molecule_signature(mol)
+        if remaining[sig] <= 0:
+            return False
+        remaining[sig] -= 1
+
+    if exact:
+        return all(v == 0 for v in remaining.values())
+    return combined_found == combined_total and all(v == 0 for v in remaining.values())
 
 
 def reachable_states(pf: PuzzleFile, recipe: RecipeResult) -> StateGraph:
@@ -584,6 +926,7 @@ def reachable_states(pf: PuzzleFile, recipe: RecipeResult) -> StateGraph:
     the graph of every distinct state found, and which states are directly
     reachable from which."""
     reactions = {r.name: r for r in build_reactions(pf)}
+    reactions.update(recipe.extra_reactions)
     start = initial_state(pf, recipe)
     start_key = _state_signature(start)
 
@@ -601,11 +944,78 @@ def reachable_states(pf: PuzzleFile, recipe: RecipeResult) -> StateGraph:
                 queue.append((nxt, nxt_idx))
             graph.add_edge(current_idx, nxt_idx, move)
 
-    inputs_key = _inputs_state_key(pf, recipe)
-    assert inputs_key in graph._index, (
+    products_needed = pf.products_needed()
+    match_idx = next(
+        (i for i, s in enumerate(graph.states)
+         if _matches_raw_reagents(s, pf, recipe, products_needed, exact=True)),
+        None,
+    )
+    if match_idx is None:
+        match_idx = next(
+            (i for i, s in enumerate(graph.states) if _matches_raw_reagents(s, pf, recipe, products_needed)),
+            None,
+        )
+    assert match_idx is not None, (
         f"{pf.name!r}: no reachable state matches the actual raw reagents — "
         "the un-react/unbond move rules failed to find a valid full "
         "decomposition path that solve_recipe already proved exists"
     )
-    graph.input_state_idx = graph._index[inputs_key]
+    graph.input_state_idx = match_idx
     return graph
+
+
+def plot_state_graph(graph: StateGraph, out_path: str = "stategraph.png", max_label_len: int = 40) -> None:
+    """Render a StateGraph as a network diagram, saved to `out_path`.
+    Visualization-only — networkx/matplotlib are imported here rather than
+    at module level so the core BFS/solver path never needs them installed.
+    The goal state (index 0) and the matched raw-reagent state
+    (graph.input_state_idx) are highlighted; edges are labeled with their
+    move (bond/triple-bond/reaction name)."""
+    import textwrap
+    import matplotlib.pyplot as plt
+    import networkx as nx
+
+    G = nx.DiGraph()
+    for idx in range(len(graph.states)):
+        G.add_node(idx)
+    for from_idx, targets in graph.edges.items():
+        for to_idx in targets:
+            G.add_edge(from_idx, to_idx, label=graph.edge_move[(from_idx, to_idx)])
+
+    # DAG (output at 0, raw reagents at input_state_idx) — a top-down "dot"
+    # layout reads much better than force-directed spring layout if
+    # graphviz is available; falls back otherwise.
+    try:
+        pos = nx.nx_agraph.graphviz_layout(G, prog="dot")
+    except ImportError:
+        pos = nx.spring_layout(G, seed=0, k=0.9)
+
+    node_colors = []
+    for idx in G.nodes:
+        if idx == 0:
+            node_colors.append("#4C9F70")   # goal / output state
+        elif idx == graph.input_state_idx:
+            node_colors.append("#C9622D")   # raw-reagent state
+        else:
+            node_colors.append("#7C93C9")
+
+    def short_label(idx):
+        text = repr(graph.states[idx])
+        return "\n".join(textwrap.wrap(text, max_label_len)[:3])
+
+    labels = {idx: f"{idx}\n{short_label(idx)}" for idx in G.nodes}
+    edge_labels = {(u, v): d["label"] for u, v, d in G.edges(data=True)}
+
+    plt.figure(figsize=(max(12, len(G.nodes) * 0.6), max(8, len(G.nodes) * 0.4)))
+    nx.draw(
+        G, pos,
+        node_color=node_colors, node_size=1400, arrows=True,
+        arrowsize=12, edge_color="#999999", width=1.2,
+    )
+    nx.draw_networkx_labels(G, pos, labels=labels, font_size=6)
+    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=6)
+
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close()

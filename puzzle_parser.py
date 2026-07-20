@@ -4,8 +4,8 @@ Format transcribed from omsim/parse.c and omsim/parse.h.
 """
 
 import struct
-from dataclasses import dataclass, field
-from typing import List
+from dataclasses import dataclass, field, replace
+from typing import List, Optional
 
 
 # Atom type byte values: the file stores the bit-position directly.
@@ -137,6 +137,79 @@ class PuzzleFile:
         return 6 * self.output_scale
 
 
+def mirror_repeat_molecule(mol: Molecule) -> Optional[Molecule]:
+    """Alternate construction of a repeating output molecule: mirror its
+    repeat marker(s) onto the opposite end instead of the one the puzzle
+    file happens to depict. A real solution isn't required to build the
+    polymer in that specific direction — trying both and keeping whichever
+    gives the better bound covers the uncertainty (see
+    puzzle_parser.alternate_repeat_puzzle / bounds.py's use of it).
+
+    The atom every repeating molecule mirrors around is always the one
+    sitting at local (0, 0) — Opus Magnum's own convention for where an
+    output molecule's "seed" atom sits. For each bond the *original*
+    repeat atom has (one per polymer "arm" — a repeat atom can have more
+    than one, e.g. sitting on a ring, closing it), delete that repeat atom
+    and its bonds, then add a fresh repeat atom next to (0, 0) at that same
+    relative direction, with the same bond type. Returns None if the
+    molecule has no repeat atom, no atom at (0, 0), a repeat atom with no
+    bonds at all, or a mirrored position would land on an already-occupied
+    hex — the mirror isn't geometrically valid for this molecule."""
+    repeat_atoms = [a for a in mol.atoms if a.type == ATOM_REPEAT]
+    if not repeat_atoms:
+        return None
+    if (0, 0) not in {(a.u, a.v) for a in mol.atoms}:
+        return None
+
+    occupied = {(a.u, a.v) for a in mol.atoms}
+    remove_positions = set()
+    new_repeat_atoms = []
+
+    for r in repeat_atoms:
+        r_pos = (r.u, r.v)
+        touching = [b for b in mol.bonds
+                    if (b.from_u, b.from_v) == r_pos or (b.to_u, b.to_v) == r_pos]
+        if not touching:
+            return None
+        remove_positions.add(r_pos)
+        for b in touching:
+            other_pos = (b.to_u, b.to_v) if (b.from_u, b.from_v) == r_pos else (b.from_u, b.from_v)
+            direction = (other_pos[0] - r_pos[0], other_pos[1] - r_pos[1])
+            new_pos = direction  # anchor is (0, 0), so new position = (0,0) + direction
+            if new_pos in occupied or any(p == new_pos for p, _ in new_repeat_atoms):
+                return None
+            new_repeat_atoms.append((new_pos, b.type))
+
+    new_atoms = [a for a in mol.atoms if (a.u, a.v) not in remove_positions]
+    new_bonds = [b for b in mol.bonds
+                 if (b.from_u, b.from_v) not in remove_positions
+                 and (b.to_u, b.to_v) not in remove_positions]
+    for pos, btype in new_repeat_atoms:
+        new_atoms.append(Atom(type=ATOM_REPEAT, u=pos[0], v=pos[1]))
+        new_bonds.append(Bond(type=btype, from_u=0, from_v=0, to_u=pos[0], to_v=pos[1]))
+
+    return Molecule(atoms=new_atoms, bonds=new_bonds)
+
+
+def alternate_repeat_puzzle(pf: PuzzleFile) -> Optional[PuzzleFile]:
+    """`pf` with every repeating output molecule's repeat marker(s)
+    mirrored onto the opposite end instead (see mirror_repeat_molecule) —
+    None if no output molecule has a repeat atom (nothing to try), or if
+    mirroring isn't geometrically valid for one that does."""
+    if not any(a.type == ATOM_REPEAT for mol in pf.outputs for a in mol.atoms):
+        return None
+    new_outputs = []
+    for mol in pf.outputs:
+        if not any(a.type == ATOM_REPEAT for a in mol.atoms):
+            new_outputs.append(mol)
+            continue
+        mirrored = mirror_repeat_molecule(mol)
+        if mirrored is None:
+            return None
+        new_outputs.append(mirrored)
+    return replace(pf, outputs=new_outputs)
+
+
 class _Parser:
     def __init__(self, data: bytes):
         self._d = data
@@ -199,6 +272,13 @@ class _Parser:
         outputs = [self.molecule() for _ in range(self.u32())]
         output_scale = self.u32()
         is_production = bool(self.u8())
+        if any(a.type == ATOM_REPEAT for mol in outputs for a in mol.atoms):
+            # ATOM_REPEAT is a structural marker in the output, not a real
+            # atom the puzzle file lists a reagent for — but schematic.py's
+            # backward search still has to isolate and "grab" one from
+            # somewhere when it fully un-bonds the output, so give it a
+            # dedicated single-atom reagent to reduce down to.
+            inputs.append(Molecule(atoms=[Atom(type=ATOM_REPEAT, u=0, v=0)], bonds=[]))
         return PuzzleFile(
             name=name,
             parts_available=parts_available,

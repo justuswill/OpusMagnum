@@ -40,6 +40,7 @@ Optimal solutions
 """
 
 import warnings
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional
 
@@ -85,6 +86,11 @@ class Reaction:
     name: str
     delta: Dict[int, int]            # atom_type -> net change per invocation
     catalyst: Optional[int] = None   # atom_type that must be present (unconsumed) but isn't free
+    alt_reagent: Optional[List[int]] = None  # see solve_recipe_combined: a
+    # combined "calcify_X_or_Y" synthetic reaction has no single fixed
+    # reagent-side atom type — delta only carries its produced side
+    # (+1 salt); this lists the alternative atom types schematic.py's
+    # backward search may freely choose among when reversing one firing.
 
 
 def build_reactions(pf: PuzzleFile) -> List[Reaction]:
@@ -165,14 +171,13 @@ class RecipeResult:
     reagent_group_size: Dict[int, int] = field(default_factory=dict)  # input index -> # identical inputs it stands in for
     reaction_counts: Dict[str, int] = field(default_factory=dict)  # reaction name -> times invoked
     waste: Dict[int, int] = field(default_factory=dict)            # atom_type -> surplus produced
+    extra_reactions: Dict[str, Reaction] = field(default_factory=dict)  # combined synthetic reactions (see solve_recipe_combined) that reaction_counts references but build_reactions doesn't define
 
 
-def solve_recipe(pf: PuzzleFile) -> RecipeResult:
-    """
-    Solve for the cheapest (fewest reagents, then fewest reactions, then
-    least waste) integer recipe that supplies every atom the required
-    outputs demand, given the puzzle's available transformation glyphs.
-    """
+def _build_recipe_lp(pf: PuzzleFile):
+    """Shared ILP construction for solve_recipe/solve_recipe_alternatives —
+    see solve_recipe's docstring for the model. Returns
+    (prob, x, y, waste, reagent_group_size, big_m), unsolved."""
     products_needed = pf.products_needed()
 
     demand: Dict[int, int] = {}
@@ -180,9 +185,11 @@ def solve_recipe(pf: PuzzleFile) -> RecipeResult:
         for atype, cnt in mol.atom_type_counts().items():
             # ATOM_REPEAT is a structural marker for repeating/polymer output
             # molecules (the length of the actual chain isn't fixed by the
-            # puzzle file), not a real atom — exclude it from the balance.
-            if atype == ATOM_REPEAT:
-                continue
+            # puzzle file), not a real atom the puzzle grants a reagent for —
+            # but it still occupies a real position/bonds in the output
+            # molecule that a backward search has to reduce down to
+            # something, so it's balanced like any other atom against the
+            # single-atom repeat reagent parse_puzzle synthesizes for it.
             demand[atype] = demand.get(atype, 0) + cnt * products_needed
 
     # Reagents with identical atom composition are fungible — collapse each
@@ -237,21 +244,282 @@ def solve_recipe(pf: PuzzleFile) -> RecipeResult:
         + pulp.lpSum(waste.values())
     )
 
-    status = prob.solve(pulp.PULP_CBC_CMD(msg=0))
-    status_str = pulp.LpStatus[status]
-    if status_str != "Optimal":
-        raise ValueError(f"no atom-balanced recipe found for {pf.name!r} (status={status_str})")
+    return prob, x, y, waste, reagent_group_size, big_m
 
+
+def _recipe_result(x, y, waste, reagent_group_size) -> RecipeResult:
     def val(v):
         return int(round(pulp.value(v) or 0))
 
     return RecipeResult(
-        status=status_str,
+        status="Optimal",
         reagent_counts={i: val(v) for i, v in x.items()},
         reagent_group_size=reagent_group_size,
         reaction_counts={name: val(v) for name, v in y.items() if val(v) > 0},
         waste={t: val(v) for t, v in waste.items() if val(v) > 0},
     )
+
+
+def solve_recipe(pf: PuzzleFile) -> RecipeResult:
+    """
+    Solve for the cheapest (fewest reagents, then fewest reactions, then
+    least waste) integer recipe that supplies every atom the required
+    outputs demand, given the puzzle's available transformation glyphs.
+
+    The objective only minimizes *totals* — it's indifferent to WHICH
+    interchangeable reagent/reaction absorbs a given count (e.g. calcify_air
+    vs calcify_fire when several elemental inputs are available), so CBC
+    returns one arbitrary optimal recipe among possibly many. See
+    solve_recipe_alternatives to enumerate the others.
+    """
+    prob, x, y, waste, reagent_group_size, _big_m = _build_recipe_lp(pf)
+    status = prob.solve(pulp.PULP_CBC_CMD(msg=0))
+    status_str = pulp.LpStatus[status]
+    if status_str != "Optimal":
+        raise ValueError(f"no atom-balanced recipe found for {pf.name!r} (status={status_str})")
+
+    return _recipe_result(x, y, waste, reagent_group_size)
+
+
+def solve_recipe_alternatives(pf: PuzzleFile, limit: int = 20) -> List[RecipeResult]:
+    """Every distinct optimal recipe (same total objective — same
+    reagent/reaction/waste totals, just a different split across
+    interchangeable choices) up to `limit`, not just the one arbitrary
+    recipe solve_recipe returns — see its docstring for why more than one
+    can exist. This matters beyond stoichiometry: schematic.py's backward
+    search and bounds.py's L_spine computation are sensitive to WHICH
+    specific reagents/reactions a recipe uses, so a different (equally
+    cheap) recipe can yield a different — sometimes sounder — bound.
+
+    Found by solving once to get the optimal objective value, pinning the
+    objective to that value (so every subsequent solve is forced to stay
+    at the same optimum rather than degrade to the next-best), then
+    repeatedly re-solving with a "no-good" cut that forces at least one
+    reagent/reaction variable to differ from every previously found
+    solution — stops when no more exist (infeasible) or `limit` is hit."""
+    prob, x, y, waste, reagent_group_size, big_m = _build_recipe_lp(pf)
+    status = prob.solve(pulp.PULP_CBC_CMD(msg=0))
+    if pulp.LpStatus[status] != "Optimal":
+        raise ValueError(f"no atom-balanced recipe found for {pf.name!r} (status={pulp.LpStatus[status]})")
+
+    def val(v):
+        return int(round(pulp.value(v) or 0))
+
+    best_objective = pulp.value(prob.objective)
+    prob += prob.objective <= best_objective  # pin every future solve to this same optimum
+
+    cut_vars = list(x.values()) + list(y.values())
+
+    results = []
+    for n in range(limit):
+        status = prob.solve(pulp.PULP_CBC_CMD(msg=0))
+        if pulp.LpStatus[status] != "Optimal":
+            break
+
+        results.append(_recipe_result(x, y, waste, reagent_group_size))
+
+        # No-good cut: force at least one reagent/reaction variable to
+        # differ from this solution before the next solve. A single "diff"
+        # binary per variable isn't enough — big-M only forces v==s when
+        # diff==0, it doesn't force v!=s when diff==1 (the solver can just
+        # leave v unchanged and still satisfy the cut, which is exactly why
+        # the first version of this returned the same solution repeatedly).
+        # Two binaries per variable, asserting v>s or v<s respectively when
+        # set, correctly forces a genuine difference.
+        diffs = []
+        for idx, v in enumerate(cut_vars):
+            s = val(v)
+            up = pulp.LpVariable(f"_up_{n}_{idx}", cat="Binary")
+            down = pulp.LpVariable(f"_down_{n}_{idx}", cat="Binary")
+            prob += v >= s + 1 - big_m * (1 - up)
+            prob += v <= s - 1 + big_m * (1 - down)
+            prob += up + down <= 1
+            diffs.append(up)
+            diffs.append(down)
+        prob += pulp.lpSum(diffs) >= 1
+
+    return results
+
+
+@dataclass
+class RecipeFlexibility:
+    essential: Dict[str, int]                    # reaction name -> fixed count every optimum needs
+    flexible_groups: List[tuple]                  # (frozenset of interchangeable reaction names, combined total count)
+
+
+def solve_recipe_flexibility(pf: PuzzleFile) -> RecipeFlexibility:
+    """Characterizes the optimal recipe's degeneracy without enumerating
+    every alternate optimum — solve_recipe_alternatives doesn't scale once
+    the flexible count gets into the hundreds (e.g. P030b's 36-way split
+    across calcify_air/earth/fire stalls CBC well before it's exhausted).
+
+    Reactions that produce the exact same output atoms (their delta's
+    positive side, e.g. every calcify_* reaction produces +1 salt
+    regardless of which elemental it consumes) are candidate substitutes
+    for each other. For each candidate group with 2+ members, every
+    member's *max* achievable count is solved for, subject to the same
+    balance constraints plus the objective pinned at its optimal value —
+    this determines TRUE group membership (a candidate whose max is 0,
+    e.g. calcify_air when no air reagent exists at all, isn't a real
+    substitute and gets excluded) independent of whatever the arbitrary
+    baseline solve happened to use, unlike testing only reactions the
+    baseline already picked (which misses substitutes that started at 0,
+    e.g. calcify_water when the baseline happened to use only
+    calcify_fire). Groups with 2+ real members are FLEXIBLE — the
+    individual split is meaningless, only the GROUP TOTAL (the baseline's
+    combined count across the group) is invariant across every optimum.
+    Everything else — lone reactions, or a "group" that collapses to one
+    real member — is ESSENTIAL, required at exactly its baseline count."""
+    prob, x, y, waste, reagent_group_size, _big_m = _build_recipe_lp(pf)
+    status = prob.solve(pulp.PULP_CBC_CMD(msg=0))
+    if pulp.LpStatus[status] != "Optimal":
+        raise ValueError(f"no atom-balanced recipe found for {pf.name!r} (status={pulp.LpStatus[status]})")
+
+    def val(v):
+        return int(round(pulp.value(v) or 0))
+
+    baseline = {name: val(v) for name, v in y.items()}
+    best_objective = pulp.value(prob.objective)
+    original_objective = prob.objective
+    prob += original_objective <= best_objective  # pin every future solve to this same optimum
+
+    reactions_by_name = {r.name: r for r in build_reactions(pf)}
+
+    def produced_signature(name):
+        return tuple(sorted((t, d) for t, d in reactions_by_name[name].delta.items() if d > 0))
+
+    candidate_groups: Dict[tuple, list] = {}
+    for name in y:
+        candidate_groups.setdefault(produced_signature(name), []).append(name)
+
+    essential = {}
+    flexible_groups = []
+    with warnings.catch_warnings():
+        # Re-pointing prob.objective at a new expression each iteration is
+        # deliberate here (see loop below), not a mistake pulp needs to
+        # warn about every time.
+        warnings.filterwarnings("ignore", message="Overwriting previously set objective")
+        for names in candidate_groups.values():
+            if len(names) == 1:
+                if baseline[names[0]] > 0:
+                    essential[names[0]] = baseline[names[0]]
+                continue
+
+            usable = []
+            for name in names:
+                prob += -y[name]  # replaces the objective: maximize this one variable
+                st = prob.solve(pulp.PULP_CBC_CMD(msg=0))
+                hi = val(y[name]) if pulp.LpStatus[st] == "Optimal" else baseline[name]
+                if hi > 0:
+                    usable.append(name)
+
+            if len(usable) >= 2:
+                flexible_groups.append((frozenset(usable), sum(baseline[n] for n in usable)))
+            elif usable and baseline[usable[0]] > 0:
+                essential[usable[0]] = baseline[usable[0]]
+        prob += original_objective  # restore, tidy but not required after the loop
+
+    return RecipeFlexibility(essential=essential, flexible_groups=flexible_groups)
+
+
+def solve_recipe_combined(pf: PuzzleFile) -> RecipeResult:
+    """solve_recipe's result, but with each flexible reaction group (see
+    solve_recipe_flexibility) collapsed into ONE combined synthetic
+    reaction (e.g. calcify_water_or_fire) carrying the group's whole
+    combined total as its budget, instead of solve_recipe's one arbitrary
+    per-member split — so schematic.py's backward search can freely choose
+    which alternative atom type to produce at each firing, sharing one
+    pool, rather than being stuck with only the specific reagent(s)
+    solve_recipe happened to pick (this is what was making some bounds
+    unsound — see P021/Courage Potion).
+
+    Only calcify_* groups are supported — a flexible group containing
+    anything else raises NotImplementedError, since combining any other
+    reaction shape needs its own reversal logic in schematic.py that
+    hasn't been written yet."""
+    recipe = solve_recipe(pf)
+    flex = solve_recipe_flexibility(pf)
+    if not flex.flexible_groups:
+        return recipe
+
+    reactions_by_name = {r.name: r for r in build_reactions(pf)}
+    reaction_counts = dict(recipe.reaction_counts)
+    reagent_counts = dict(recipe.reagent_counts)
+    extra_reactions = dict(recipe.extra_reactions)
+
+    for names, total in flex.flexible_groups:
+        if not all(n.startswith("calcify_") for n in names):
+            raise NotImplementedError(
+                f"flexible reaction group {sorted(names)} isn't all calcify_* — "
+                "combining non-calcification reactions isn't implemented"
+            )
+        types = sorted(
+            t for n in names for t, d in reactions_by_name[n].delta.items() if d < 0
+        )
+        combined_name = "calcify_" + "_or_".join(ATOM_NAMES[t] for t in types)
+        for n in names:
+            reaction_counts.pop(n, None)
+        reaction_counts[combined_name] = total
+        extra_reactions[combined_name] = Reaction(
+            name=combined_name, delta={ATOM_SALT: 1}, alt_reagent=types,
+        )
+
+        # Rebalance the matching reagent counts proportionally to each
+        # member's own duplicate-glyph count, instead of leaving whatever
+        # arbitrary (often very lopsided) split solve_recipe's ILP happened
+        # to settle on: schematic.py's L_spine computation still keys off
+        # individual reagent counts per type even though the reaction
+        # budget is now shared, so an unbalanced split needlessly inflates
+        # latency for whichever type got overloaded.
+        #
+        # Only the *calcification-feedstock* portion of each type's count
+        # is actually flexible — `total` (this group's reaction-firing
+        # count) is exactly that portion, already excluding any atoms of
+        # these types the output needs *directly* (bonded in, never
+        # calcified). That direct-use amount is fixed per type (driven by
+        # the output's own structure, from pf.outputs, not a free choice)
+        # and must be added back unchanged, not redistributed — an earlier
+        # version of this rebalanced the *whole* reagent total including
+        # that fixed portion, which desynced reagent_counts from what any
+        # real state in the graph could realize (P025 had 0% of its air
+        # count and 100% of its water count as direct-use, so redistributing
+        # both as if fully flexible produced an unreachable split).
+        member_indices = [
+            i for i, mol in enumerate(pf.inputs)
+            if i in recipe.reagent_counts
+            and len(mol.atom_type_counts()) == 1
+            and next(iter(mol.atom_type_counts())) in types
+        ]
+        if member_indices:
+            products_needed = pf.products_needed()
+            demand = Counter()
+            for mol in pf.outputs:
+                for atype, cnt in mol.atom_type_counts().items():
+                    demand[atype] += cnt * products_needed
+            direct_use = {
+                i: demand.get(next(iter(pf.inputs[i].atom_type_counts())), 0)
+                for i in member_indices
+            }
+
+            repeats = {i: recipe.reagent_group_size.get(i, 1) for i in member_indices}
+            total_repeats = sum(repeats.values())
+            base = {i: (total * repeats[i]) // total_repeats for i in member_indices}
+            remainder = total - sum(base.values())
+            # Largest-remainder apportionment: hand the few leftover units
+            # (from integer division) to whichever members' exact share
+            # rounded down the most, so the total still adds up exactly.
+            by_remainder = sorted(
+                member_indices,
+                key=lambda i: (total * repeats[i]) % total_repeats,
+                reverse=True,
+            )
+            for i in by_remainder[:remainder]:
+                base[i] += 1
+            for i in member_indices:
+                reagent_counts[i] = direct_use[i] + base[i]
+
+    return replace(recipe, reagent_counts=reagent_counts, reaction_counts=reaction_counts,
+                    extra_reactions=extra_reactions)
 
 
 def necessary_inputs(pf: PuzzleFile, recipe: RecipeResult) -> set:

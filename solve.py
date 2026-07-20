@@ -22,7 +22,7 @@ import subprocess
 
 from puzzle_parser import parse_puzzle, ATOM_NAMES
 from bounds import cycles_lower_bound, cost_lower_bound, area_lower_bound
-from stoichiometry import solve_recipe, describe_molecule
+from stoichiometry import solve_recipe, solve_recipe_combined, describe_molecule
 from schematic import reachable_states
 
 PUZZLES_DIR = os.path.join(os.path.dirname(__file__), "puzzles")
@@ -164,10 +164,16 @@ def main(args):
     print(f"Type      : {'PRODUCTION' if is_prod else 'NORMAL'}")
     print()
 
-    recipe = solve_recipe(pf)
-    states = reachable_states(pf, recipe)
+    try:
+        recipe = solve_recipe_combined(pf)
+    except NotImplementedError:
+        # A flexible reaction group exists but isn't all calcify_* — combining
+        # it isn't supported yet (see solve_recipe_combined), fall back to
+        # solve_recipe's single arbitrary split rather than failing outright.
+        recipe = solve_recipe(pf)
     print_recipe(pf, recipe)
     print()
+    states = reachable_states(pf, recipe)
     print(states)
     print()
 
@@ -262,12 +268,12 @@ def _chapter_1_2_pids():
         "P020",  # Armor Filament
         "P021",  # Courage Potion
         "P022",  # Surrender Flare
-    ][5:]
+    ]
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compute proven bounds for the optimal SUM solution.")
-    parser.add_argument("--puzzle", default=None, metavar="ID",
+    parser.add_argument("--puzzle", default='P039', metavar="ID",
                          help="Puzzle ID (default: run every chapter 1+2 puzzle, P007-P022)")
     args = parser.parse_args()
 

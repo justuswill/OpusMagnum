@@ -9,16 +9,21 @@ equals the best known record.
 
 import itertools
 import math
-from collections import Counter
+import re
+from collections import Counter, deque
 
 from puzzle_parser import (
-    PuzzleFile,
+    PuzzleFile, ATOM_NAMES,
     ATOM_SALT, ATOM_VITAE, ATOM_MORS, ATOM_REPEAT, ATOM_QUINTESSENCE, ATOM_QUICKSILVER,
     ELEMENTALS,
     PART_BARON, PART_PROJECTION, PART_PURIFICATION,
+    alternate_repeat_puzzle,
 )
-from stoichiometry import RecipeResult, METAL_CHAIN, necessary_inputs, describe_molecule
-from schematic import StateGraph, molecule_signature
+from stoichiometry import (
+    RecipeResult, METAL_CHAIN, necessary_inputs, describe_molecule,
+    solve_recipe, solve_recipe_combined,
+)
+from schematic import StateGraph, molecule_signature, reachable_states, _is_drop_and_create
 
 
 def _all_paths_nodes(graph: StateGraph, start: int, goal: int) -> list:
@@ -185,7 +190,12 @@ def _path_l_spine(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph,
     path = paths[p_idx]
     D = len(path) - 1
     moves = [graph.edge_move[(path[k], path[k - 1])] for k in range(1, D + 1)]
-    blocking_moves = moves[max(D - L_spine, 0):]
+    # Slice by natural_peak (the pre-queueing structural value), not the
+    # already-bumped L_spine — slicing by L_spine here double-counts the
+    # queueing delay: once implicitly (more moves shown than actually
+    # structural) and once explicitly via extra_output_delay below, making
+    # the displayed "=1" terms sum to more than the returned L_spine.
+    blocking_moves = moves[max(D - natural_peak, 0):]
     steps = " + ".join(f"{mv}=1" for mv in blocking_moves) if blocking_moves else "already available"
     penalty = L_spine - natural_peak
     if penalty:
@@ -228,6 +238,113 @@ def _prune_dominated_paths(paths: list, raw_ls_by_path: dict, reagent_sig: dict)
     return kept
 
 
+def _pareto_paths_raw_ls(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph) -> list:
+    """Every Pareto-optimal path from graph.input_state_idx to the output
+    (node 0), each paired with its already-computed raw_L values — a single
+    BFS/DP that prunes dominated partial paths as it goes, instead of
+    enumerating every path first (potentially exponential — see
+    _all_paths_nodes) and only pruning afterward (see
+    _prune_dominated_paths) once every path's already been walked a second
+    time for its raw_L values (see _path_raw_ls). Kept alongside that older
+    trio (now unused, left in place rather than deleted) in case this
+    combined version needs comparing against or falling back to later.
+
+    Walks in graph.edges' own stored direction, starting at the output (0)
+    — the same direction _all_paths_nodes' own DFS already traverses, so no
+    reverse adjacency map is needed. This is chronologically *backward*
+    (undoing moves), which turns out to make raw_L trivial to compute
+    on-line: raw_L for a consumption event is D-k+1, i.e. "1 + how many
+    forward steps remain from this event to the output" — and "how many
+    forward steps remain to the output" is exactly the walk's *backward*
+    distance j from node 0 so far, needing no knowledge of D (the eventual
+    total path length, only known once the walk reaches
+    graph.input_state_idx) at all. So each consumption event gets its
+    final raw_L the moment it's discovered, no deferred shift needed.
+
+    Domination (a partial path's raw_L-so-far componentwise <= another's,
+    per reagent type) is still safe to prune on early exactly as
+    _prune_dominated_paths reasons for complete paths: both partial paths
+    sit at the same node, so they share every possible remaining suffix,
+    and appending the identical suffix to both preserves the <=."""
+    reagent_sig = _reagent_sig(pf, recipe)
+    start, goal = graph.input_state_idx, 0
+
+    counts_cache = {}
+
+    def type_counts(node):
+        c = counts_cache.get(node)
+        if c is None:
+            c = Counter()
+            for mol in graph.states[node].molecules:
+                sig = molecule_signature(mol)
+                if sig in reagent_sig:
+                    c[sig] += 1
+            counts_cache[node] = c
+        return c
+
+    in_degree = {i: 0 for i in range(len(graph.states))}
+    for a, bs in graph.edges.items():
+        for b in bs:
+            in_degree[b] += 1
+
+    order = []
+    remaining = dict(in_degree)
+    queue = deque(i for i in range(len(graph.states)) if remaining[i] == 0)
+    while queue:
+        node = queue.popleft()
+        order.append(node)
+        for nxt in graph.edges.get(node, []):
+            remaining[nxt] -= 1
+            if remaining[nxt] == 0:
+                queue.append(nxt)
+
+    def dominates(a, b):
+        return all(x <= y for sig in a for x, y in zip(sorted(a[sig]), sorted(b.get(sig, []))))
+
+    # profile: {sig: [raw_L, ...]} (final values, no deferred shift); path:
+    # node-index list built so far, in backward order (goal first — gets
+    # reversed to forward/start-first order at the end, to match
+    # _all_paths_nodes' return convention); j: backward distance from goal.
+    profiles = {goal: [({}, [goal], 0)]}
+    for node in order:
+        entries = profiles.get(node)
+        if not entries:
+            continue
+        cur_counts = type_counts(node)
+        for nxt in graph.edges.get(node, []):
+            # forward direction is nxt (more decomposed, earlier) -> node
+            # (less decomposed, later); the count drop on that forward
+            # step is this backward step's consumption event.
+            consumed = type_counts(nxt) - cur_counts
+            bucket = profiles.setdefault(nxt, [])
+            for profile, path, j in entries:
+                raw_l = j + 1
+                new_profile = {sig: list(ages) for sig, ages in profile.items()}
+                for sig, cnt in consumed.items():
+                    if cnt > 0:
+                        new_profile.setdefault(sig, []).extend([raw_l] * cnt)
+                new_path = path + [nxt]
+                new_j = j + 1
+
+                dominated = False
+                survivors = []
+                for other_profile, other_path, other_j in bucket:
+                    if dominated or dominates(other_profile, new_profile):
+                        dominated = True
+                        survivors.append((other_profile, other_path, other_j))
+                    elif not dominates(new_profile, other_profile):
+                        survivors.append((other_profile, other_path, other_j))
+                    # else new_profile dominates other_profile: drop other
+                if not dominated:
+                    survivors.append((new_profile, new_path, new_j))
+                bucket[:] = survivors
+
+    results = []
+    for profile, path, _j in profiles.get(start, []):
+        results.append((list(reversed(path)), profile))
+    return results
+
+
 def _cadence_latency(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph) -> tuple[int, str]:
     """L_spine across every structurally-distinct path from the raw reagents
     to the output (see schematic.py; _all_paths_nodes returns them in this
@@ -259,9 +376,12 @@ def _cadence_latency(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph) ->
         unit_count = count // products_needed
         period = math.lcm(period, repeats // math.gcd(unit_count, repeats))
 
-    paths = _all_paths_nodes(graph, graph.input_state_idx, 0)
-    raw_ls_by_path = {id(path): _path_raw_ls(pf, recipe, graph, path) for path in paths}
-    paths = _prune_dominated_paths(paths, raw_ls_by_path, _reagent_sig(pf, recipe))
+    # paths = _all_paths_nodes(graph, graph.input_state_idx, 0)
+    # raw_ls_by_path = {id(path): _path_raw_ls(pf, recipe, graph, path) for path in paths}
+    # paths = _prune_dominated_paths(paths, raw_ls_by_path, _reagent_sig(pf, recipe))
+    pareto = _pareto_paths_raw_ls(pf, recipe, graph)
+    paths = [path for path, _raw_ls in pareto]
+    raw_ls_by_path = {id(path): raw_ls for path, raw_ls in pareto}
 
     best = None
     for assignment in itertools.combinations_with_replacement(paths, period):
@@ -293,7 +413,7 @@ def _bond_type_counts(mols):
     return normal, triplex
 
 
-def cycles_lower_bound(pf: PuzzleFile, recipe: RecipeResult, states: StateGraph) -> tuple[int, str]:
+def cycles_lower_bound_single(pf: PuzzleFile, recipe: RecipeResult, states: StateGraph) -> tuple[int, str]:
     """
     Throughput (N) + Steps (L) (+ 1) lower bound on cycle count.
     Each input may have their own N, L so one dominates.
@@ -324,7 +444,47 @@ def cycles_lower_bound(pf: PuzzleFile, recipe: RecipeResult, states: StateGraph)
     N = products_needed
     note = f"output throughput: {products_needed} products, 1/cycle"
 
+    # A combined reaction group's alternative reagents (see
+    # stoichiometry.solve_recipe_combined, e.g. calcify_fire_or_water) can
+    # be grabbed from in parallel — pool their counts/repeats together
+    # rather than checking each independently, or this term stays
+    # bottlenecked on whichever single reagent solve_recipe's arbitrary
+    # split happened to load up, understating real throughput and
+    # producing an unsound (too-large) bound.
+    combined_reagent_indices = set()
+    for r in recipe.extra_reactions.values():
+        # Only representative reagent indices (recipe.reagent_counts'
+        # keys) — a raw pf.inputs index that's just a duplicate of some
+        # representative isn't its own entry in reagent_group_size, so
+        # .get(i, 1) would silently default it to 1 and double-count it
+        # on top of its representative's own (correct, already-summed)
+        # group_size.
+        member_indices = [
+            i for i, mol in enumerate(pf.inputs)
+            if i in recipe.reagent_counts
+            and len(mol.atom_type_counts()) == 1
+            and next(iter(mol.atom_type_counts())) in (r.alt_reagent or [])
+        ]
+        if not member_indices:
+            continue
+        combined_reagent_indices.update(member_indices)
+        total_count = sum(recipe.reagent_counts.get(i, 0) for i in member_indices)
+        total_repeats = sum(recipe.reagent_group_size.get(i, 1) for i in member_indices)
+        if total_count <= 0:
+            continue
+        cycles = 2 * math.ceil(total_count / total_repeats)
+        if cycles > N:
+            N = cycles
+            breakdown = " + ".join(
+                f"{recipe.reagent_group_size.get(i, 1)}x{ATOM_NAMES[next(iter(pf.inputs[i].atom_type_counts()))]}"
+                for i in member_indices
+            )
+            note = (f"input throughput {N}: {total_count}x needed from combined "
+                    f"{total_repeats} duplicates ({breakdown})")
+
     for i, count in recipe.reagent_counts.items():
+        if i in combined_reagent_indices:
+            continue  # already accounted for, pooled with the rest of its combined group above
         if count <= 0:
             continue
         repeats = recipe.reagent_group_size.get(i, 1)
@@ -343,6 +503,32 @@ def cycles_lower_bound(pf: PuzzleFile, recipe: RecipeResult, states: StateGraph)
     latency_note = f"input latency {L}: " + " + ".join(latency_parts)
 
     return N + L, f"{note}, {latency_note}"
+
+
+def cycles_lower_bound(pf: PuzzleFile, recipe: RecipeResult, states: StateGraph) -> tuple[int, str]:
+    """cycles_lower_bound_single(pf), plus — for a repeating output — the same
+    computation with the repeat marker(s) mirrored onto the opposite end
+    (see puzzle_parser.alternate_repeat_puzzle): a real solution isn't
+    required to build the polymer in the direction the puzzle file happens
+    to depict, so try both and keep whichever gives the smaller (still
+    sound) bound."""
+    c_lo, c_note = cycles_lower_bound_single(pf, recipe, states)
+
+    alt_pf = alternate_repeat_puzzle(pf)
+    if alt_pf is not None:
+        try:
+            try:
+                alt_recipe = solve_recipe_combined(alt_pf)
+            except NotImplementedError:
+                alt_recipe = solve_recipe(alt_pf)
+            alt_states = reachable_states(alt_pf, alt_recipe)
+            alt_c_lo, alt_c_note = cycles_lower_bound_single(alt_pf, alt_recipe, alt_states)
+        except AssertionError:
+            alt_c_lo = None
+        if alt_c_lo is not None and alt_c_lo < c_lo:
+            c_lo, c_note = alt_c_lo, alt_c_note + " (mirrored repeat)"
+
+    return c_lo, c_note
 
 
 def _needed_parts(pf: PuzzleFile) -> dict:
@@ -463,7 +649,7 @@ def cost_lower_bound(pf: PuzzleFile) -> tuple[int, str]:
       # ignored for now:
       - DLC:
           - a rejection glyph (20 g) if ...
-          - a division glyph (2g g) if ...
+          - a division glyph (20 g) if ...
           - ravari wheel (30g) + proliferation glyph (20g) = 50g total if ...
       - additional track if access points insufficient
         - full access + partial access (existing bonds or bonder) + no access (?) glyphs
