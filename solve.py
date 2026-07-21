@@ -22,7 +22,7 @@ import subprocess
 
 from puzzle_parser import parse_puzzle, ATOM_NAMES
 from bounds import cycles_lower_bound, cost_lower_bound, area_lower_bound
-from stoichiometry import solve_recipe, solve_recipe_combined, describe_molecule
+from stoichiometry import solve_recipe, solve_recipe_combined, solve_recipe_cheap, describe_molecule
 from schematic import reachable_states
 
 PUZZLES_DIR = os.path.join(os.path.dirname(__file__), "puzzles")
@@ -166,11 +166,12 @@ def main(args):
 
     try:
         recipe = solve_recipe_combined(pf)
+        recipe_cheap = solve_recipe_cheap(pf)
     except NotImplementedError:
         # A flexible reaction group exists but isn't all calcify_* — combining
         # it isn't supported yet (see solve_recipe_combined), fall back to
         # solve_recipe's single arbitrary split rather than failing outright.
-        recipe = solve_recipe(pf)
+        recipe = recipe_cheap = solve_recipe(pf)
     print_recipe(pf, recipe)
     print()
     states = reachable_states(pf, recipe)
@@ -179,10 +180,10 @@ def main(args):
 
     # ── Analytic lower bounds ─────────────────────────────────────────────
 
-    g_lo, g_note = cost_lower_bound(pf)
+    g_lo, g_note = cost_lower_bound(pf, recipe_cheap)
     c_lo, c_note = cycles_lower_bound(pf, recipe, states)
     if not is_prod:
-        t_lo, t_note = area_lower_bound(pf, recipe)
+        t_lo, t_note = area_lower_bound(pf, recipe_cheap)
     else:
         t_lo, t_note = 1, "trivial (≥1 instruction)"
 
@@ -273,7 +274,7 @@ def _chapter_1_2_pids():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compute proven bounds for the optimal SUM solution.")
-    parser.add_argument("--puzzle", default='P030b', metavar="ID",
+    parser.add_argument("--puzzle", default='P024', metavar="ID",
                          help="Puzzle ID (default: run every chapter 1+2 puzzle, P007-P022)")
     args = parser.parse_args()
 

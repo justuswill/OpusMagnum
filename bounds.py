@@ -21,7 +21,7 @@ from puzzle_parser import (
 )
 from stoichiometry import (
     RecipeResult, METAL_CHAIN, necessary_inputs, describe_molecule,
-    solve_recipe, solve_recipe_combined,
+    solve_recipe, solve_recipe_combined, solve_recipe_cheap,
 )
 from schematic import StateGraph, molecule_signature, reachable_states, _is_drop_and_create
 
@@ -543,12 +543,13 @@ def cycles_lower_bound(pf: PuzzleFile, recipe: RecipeResult, states: StateGraph)
     return c_lo, c_note
 
 
-def _needed_parts(pf: PuzzleFile) -> dict:
+def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
     """
     Which extra parts a solution is provably forced to buy, from atom-type
-    and bond-type presence/absence between inputs and outputs. Shared by
-    cost_lower_bound and area_lower_bound (see cost_lower_bound's docstring
-    for the exact conditions)
+    and bond-type presence/absence between inputs and outputs, plus how
+    much Track that forces (needed["tracks"], needed["access"] — see
+    cost_lower_bound's docstring for the exact access/track rules). Shared
+    by cost_lower_bound and area_lower_bound.
     """
     # Collect atom types and bond types across inputs and outputs
     input_atom_types: set[int] = set()
@@ -600,7 +601,7 @@ def _needed_parts(pf: PuzzleFile) -> dict:
     else:
         metal_glyph = None  # neither available — out of scope (see rejection/division)
 
-    return {
+    needed = {
         "bonder": _new(set(output_normal_bonds), set(input_normal_bonds)),
         "unbonder": _new(input_bonds, output_bonds),
         "bonder_prisma": _new(set(output_triplex_bonds), set(input_triplex_bonds)),
@@ -638,10 +639,118 @@ def _needed_parts(pf: PuzzleFile) -> dict:
                          and ATOM_QUINTESSENCE not in input_atom_types),
     }
 
+    # Access/Track: animismus/dispersion/unification/purification each have
+    # their own minimum track count, a fixed mechanical requirement to
+    # operate the glyph at all (its ports are spread too far apart for a
+    # single fixed hex to reach) — this applies regardless of whether a
+    # bonder is also in the picture.
+    tracks = 0
+    if needed["dispersion"]:
+        tracks = max(tracks, 2)
+    if needed["unification"]:
+        tracks = max(tracks, 3)
+    if needed["metal_glyph"] == "purification":
+        tracks = max(tracks, 3)
+    if needed["animismus"]:
+        tracks = max(tracks, 4)
 
-def cost_lower_bound(pf: PuzzleFile) -> tuple[int, str]:
+    # Once none of bonder, bonder-prisma, or an already-bonded input reagent
+    # is in play (those give the mechanism a richer, non-single-hex shape
+    # this simplified count doesn't model), every reagent the recipe
+    # actually draws from and every output is one point of "access" an arm
+    # has to physically reach — each additional glyph beyond that adds its
+    # own access cost too. A bare arm reaches 6 neighbors for free; each
+    # Track tile (5g) adds another 6, so track count only needs to grow
+    # past whatever minimum was already set above if access still exceeds
+    # that many tracks' worth of reach.
+    has_input_bonds = any(mol.bonds for mol in pf.inputs)
+    # A repeat marker isn't a real, separately-reachable zone — the
+    # synthetic single-atom reagent puzzle_parser.py adds for every
+    # repeating-output puzzle only exists so schematic.py's backward search
+    # has something to fully decompose down to, and a repeating *output*'s
+    # repeat atom(s) are produced by the mechanism's own repeating
+    # structure, not something a solution has to separately reach. So any
+    # molecule containing a repeat atom at all — on either side — doesn't
+    # cost an access point.
+    access = len({
+        i for i, count in recipe.reagent_counts.items()
+        if count > 0 and not any(a.type == ATOM_REPEAT for a in pf.inputs[i].atoms)
+    }) + sum(1 for mol in pf.outputs if not any(a.type == ATOM_REPEAT for a in mol.atoms))
+    if not needed["bonder"] and not needed["bonder_prisma"] and not has_input_bonds:
+        # full access
+        access_points = {
+            "unbonder": 2, "calcification": 1, "baron_duplication": 1, "metal_glyph": 2,
+            "dispersion": 4, "unification": 3, "animismus": 4,
+        }
+    else:
+        # zero/partial access
+        access_points = {"metal_glyph": 1, "dispersion": 4, "animismus": 4, "unification": 3}
+        if needed["bonder"] and not has_input_bonds:
+            access_points["bonder"] = 2
+        if needed["bonder_prisma"] and not has_input_bonds:
+            access_points["bonder_prisma"] = 2 if not needed["bonder"] else 1
+        # A single-atom reagent only needs its own dedicated access to reach
+        # a bonder if it's actually getting bonded into a bigger output
+        # structure (a multi-atom output) — and only if no *other*,
+        # already-multi-atom input also carries that type in, since that
+        # one would already be positioned to supply the bond for free.
+        multi_atom_output_types = {a.type for mol in pf.outputs if len(mol.atoms) > 1
+                                    for a in mol.atoms} - {ATOM_REPEAT}
+        multi_atom_input_types = {a.type for mol in pf.inputs if len(mol.atoms) > 1 for a in mol.atoms}
+        # A single low-rank metal (e.g. lead) also counts if a *higher*
+        # metal further up METAL_CHAIN (what it becomes after enough
+        # projection/purification firings) is the one actually getting
+        # bonded into a multi-atom output — same reasoning, just one step
+        # removed since the metal changes type along the way. But if some
+        # *other*, already-bonded metal sits anywhere between the two on
+        # the chain (e.g. bonded-in silver, with lead needed and gold in
+        # the output), the chain reaction can carry on from that free
+        # bonded entry point instead — lead doesn't need its own access.
+        bondable_single_types = (multi_atom_output_types - multi_atom_input_types) | {
+            METAL_CHAIN[idx]
+            for idx in range(len(METAL_CHAIN))
+            for hidx in range(idx + 1, len(METAL_CHAIN))
+            if METAL_CHAIN[hidx] in multi_atom_output_types
+            and not any(METAL_CHAIN[j] in multi_atom_input_types for j in range(idx, hidx + 1))
+        }
+        has_single_atom_input = any(
+            len(pf.inputs[i].atoms) == 1 and pf.inputs[i].atoms[0].type in bondable_single_types
+            for i, count in recipe.reagent_counts.items() if count > 0
+        )
+        if has_single_atom_input and (needed["bonder"] or needed["bonder_prisma"]):
+            access += 1
+    if needed["metal_glyph"] == "purification":
+        # Unlike projection, Purification always needs 3 access/tracks
+        # regardless of which branch above applied.
+        access_points["metal_glyph"] = 3
+    for key, points in access_points.items():
+        value = needed[key]
+        present = (value is not None) if key == "metal_glyph" else bool(value)
+        if present:
+            access += points
+
+    # baseline_tracks (the glyph-specific minimum computed above) is a real
+    # board-space requirement — area-costing. Any *further* extension here
+    # is only required if we don't use pistons (as they provide 18 access)
+    baseline_tracks = tracks
+    if tracks:
+        while tracks * 6 < access:
+            tracks += 1
+    elif access > 6:
+        tracks = 1
+        while tracks * 6 < access:
+            tracks += 1
+
+    needed["access"] = access
+    needed["tracks"] = tracks
+    needed["baseline_tracks"] = baseline_tracks
+    return needed
+
+
+def cost_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
     """
-    Minimum cost based on required parts.
+    Minimum cost based on required parts, plus Track if this puzzle's glyphs
+    outnumber what a bare arm can reach.
 
     Every solution needs:
       - at least 1 arm (20g)
@@ -656,25 +765,24 @@ def cost_lower_bound(pf: PuzzleFile) -> tuple[int, str]:
       - a projection OR purification glyph (20g) if any metal output is not in any input but a lower-rank metal is
       - an animismus glyph (20g) if vitae or mors appear in any output but not in any inputs
         - 4 additional tracks (20g) to access the glyph
-      - a dispersion glyph (20 g) if any outputs contains (air/earth/fire/water) that is not in any input, and the berlow wheel is disabled
-      - a unification glyph (20 g) if any output contains quintessence but none of the inputs
+      - a dispersion glyph (20g) if any outputs contains (air/earth/fire/water) that is not in any input, and the berlow wheel is disabled
+        - 4 additional tracks (20g) to access the glyph
+      - a unification glyph (20g) if any output contains quintessence but none of the inputs
+        - 3 additional tracks (15g) to access the glyph
+      - track (5g each) if the access points the arm provides are less than the ones needed by glyphs.
+        If bonds are available glyphs can be zero-access and only inputs/outputs need to be accessed.
       # ignored for now:
       - DLC:
           - a rejection glyph (20 g) if ...
           - a division glyph (20 g) if ...
           - ravari wheel (30g) + proliferation glyph (20g) = 50g total if ...
-      - additional track if access points insufficient
-        - full access + partial access (existing bonds or bonder) + no access (?) glyphs
-        - access per arm + #track
-        - channels
 
     refs:
     https://biggieblog.com/optimizing-cost-in-opus-magnum/
-    # todo check track proofs: stamina potion, Very Dark Thread, Voltaic Coil
 
     These are hard minimums — a solution with any fewer parts would be invalid.
     """
-    needed = _needed_parts(pf)
+    needed = _needed_parts(pf, recipe)
 
     g_lo = 20
     reasons = ["1×arm=20g"]
@@ -698,14 +806,21 @@ def cost_lower_bound(pf: PuzzleFile) -> tuple[int, str]:
         g_lo += 20  # projection=20g, purification=20g — same either way
         reasons.append(f"1×{needed['metal_glyph']}=20g")
     if needed["animismus"]:
-        g_lo += 40  # animismus=20g + 4×track=20g
-        reasons.append("1×animismus=20g + 4×track=20g")
+        g_lo += 20
+        reasons.append("1×animismus=20g")
     if needed["dispersion"]:
         g_lo += 20
         reasons.append("1×dispersion=20g")
     if needed["unification"]:
         g_lo += 20
         reasons.append("1×unification=20g")
+
+    if needed["tracks"]:
+        g_lo += needed["tracks"] * 5
+        if needed["tracks"] > needed["baseline_tracks"]:
+            reasons.append(f"{needed['tracks']}×track=5g (access={needed['access']})")
+        else:
+            reasons.append(f"{needed['tracks']}×track=5g")
 
     return g_lo, " + ".join(reasons)
 
@@ -717,7 +832,7 @@ def area_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
     berlow wheel on tracks can expose the underlying hexes:
       - 0 track: 7+0, 2 track: 4+6, 3 track: 3+10
     """
-    needed = _needed_parts(pf)
+    needed = _needed_parts(pf, recipe)
 
     a_lo = 1  # arm base
     reasons = ["1×arm=1"]
@@ -749,8 +864,17 @@ def area_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
         a_lo += 5
         reasons.append("1×unification=5")
 
+    if needed["animismus"] or needed["dispersion"] or needed["unification"] or needed["metal_glyph"] == "purification":
+        a_lo += 1
+        reasons.append("access=1")
+
     input_atoms = sum(pf.inputs[i].atom_count() for i in necessary_inputs(pf, recipe))
-    output_atoms = sum(mol.atom_count() for mol in pf.outputs)
+    products_needed = pf.products_needed()
+    output_atoms = sum(
+        products_needed * (mol.atom_count() - 1) if any(a.type == ATOM_REPEAT for a in mol.atoms)
+        else mol.atom_count()
+        for mol in pf.outputs
+    )
     a_lo += input_atoms + output_atoms
 
     # Track use based on area count

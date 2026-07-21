@@ -522,6 +522,75 @@ def solve_recipe_combined(pf: PuzzleFile) -> RecipeResult:
                     extra_reactions=extra_reactions)
 
 
+def solve_recipe_cheap(pf: PuzzleFile) -> RecipeResult:
+    """solve_recipe's result, but with each flexible reaction group (see
+    solve_recipe_flexibility) concentrated onto a single member instead of
+    solve_recipe's one arbitrary split — the opposite of
+    solve_recipe_combined's proportional-to-duplicate-count spread.
+
+    That spread exists purely to maximize throughput for schematic.py's
+    backward search / cycles_lower_bound (more physical reagent zones
+    working in parallel means fewer cycles); cost_lower_bound/
+    area_lower_bound's access-point count doesn't care about cycles at
+    all, and a real solution can draw an arbitrarily large total from a
+    single reagent zone over enough cycles, so minimizing the *number of
+    distinct reagent zones actually used* is what actually minimizes cost
+    — hence concentrating onto as few nodes as possible rather than
+    spreading. Unlike solve_recipe_combined, the result needs no combined
+    synthetic reaction (no ambiguity is left once concentrated), so this
+    works for any flexible group, not just calcify_*."""
+    recipe = solve_recipe(pf)
+    flex = solve_recipe_flexibility(pf)
+    if not flex.flexible_groups:
+        return recipe
+
+    reactions_by_name = {r.name: r for r in build_reactions(pf)}
+    reaction_counts = dict(recipe.reaction_counts)
+    reagent_counts = dict(recipe.reagent_counts)
+
+    products_needed = pf.products_needed()
+    demand = Counter()
+    for mol in pf.outputs:
+        for atype, cnt in mol.atom_type_counts().items():
+            demand[atype] += cnt * products_needed
+
+    for names, total in flex.flexible_groups:
+        types = sorted(
+            t for n in names for t, d in reactions_by_name[n].delta.items() if d < 0
+        )
+        member_indices = [
+            i for i, mol in enumerate(pf.inputs)
+            if i in recipe.reagent_counts
+            and len(mol.atom_type_counts()) == 1
+            and next(iter(mol.atom_type_counts())) in types
+        ]
+        if not member_indices:
+            continue
+
+        direct_use = {
+            i: demand.get(next(iter(pf.inputs[i].atom_type_counts())), 0)
+            for i in member_indices
+        }
+        # Prefer a member that already needs a reagent zone regardless
+        # (direct_use > 0) — piling the whole flexible total onto it costs
+        # no *extra* access point at all. Otherwise fall back to whichever
+        # member solve_recipe's own arbitrary split already leaned on
+        # most, disturbing the baseline as little as possible.
+        chosen = max(member_indices, key=lambda i: (direct_use[i] > 0, recipe.reagent_counts.get(i, 0)))
+        for i in member_indices:
+            reagent_counts[i] = direct_use[i] + (total if i == chosen else 0)
+
+        type_to_name = {
+            next(t for t, d in reactions_by_name[n].delta.items() if d < 0): n
+            for n in names
+        }
+        chosen_type = next(iter(pf.inputs[chosen].atom_type_counts()))
+        for n in names:
+            reaction_counts[n] = total if n == type_to_name[chosen_type] else 0
+
+    return replace(recipe, reagent_counts=reagent_counts, reaction_counts=reaction_counts)
+
+
 def necessary_inputs(pf: PuzzleFile, recipe: RecipeResult) -> set:
     """
     Representative input indices whose whole reagent shape is required for
