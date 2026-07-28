@@ -71,7 +71,7 @@ Simplifications (deliberately out of scope for this module):
 from collections import Counter, deque
 from dataclasses import dataclass, replace
 from itertools import combinations, product as iproduct
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from puzzle_parser import (
     PuzzleFile, Molecule, Atom, Bond, ATOM_NAMES,
@@ -129,6 +129,12 @@ class StateGraph:
         # *any* of them and take whichever gives the best result, not just
         # the first one this BFS happened to discover.
         self.input_state_indices: List[int] = []
+        # Memo for bounds._cadence_latency: (id(recipe), result), since a
+        # graph is always built by reachable_states(pf, recipe) for one
+        # specific recipe, and solve.py's SUM-tightening loop calls into it
+        # repeatedly with that same (pf, recipe, graph) triple — recomputing
+        # the same combinatorial path search on every iteration otherwise.
+        self._cadence_latency_cache: Optional[Tuple[int, tuple]] = None
 
     def add_state(self, state: State, key: tuple) -> int:
         idx = len(self.states)

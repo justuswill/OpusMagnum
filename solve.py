@@ -21,7 +21,7 @@ import re
 import subprocess
 
 from puzzle_parser import parse_puzzle, ATOM_NAMES
-from bounds import cycles_lower_bound, cost_lower_bound, area_lower_bound
+from bounds import cycles_lower_bound, cost_lower_bound, area_lower_bound, cycles_lower_bound_for_budget
 from stoichiometry import solve_recipe, solve_recipe_combined, solve_recipe_cheap, describe_molecule
 from schematic import reachable_states
 
@@ -175,8 +175,8 @@ def main(args):
     print_recipe(pf, recipe)
     print()
     states = reachable_states(pf, recipe)
-    print(states)
-    print()
+    # print(states)
+    # print()
 
     # ── Analytic lower bounds ─────────────────────────────────────────────
 
@@ -224,22 +224,31 @@ def main(args):
     print(row(t_label,     t_lo, {c: scores[c][t_key]   for c in present_cats}))
 
     sums = {c: scores[c]["g"] + scores[c]["c"] + scores[c][t_key] for c in present_cats}
-    sum_lo = g_lo + c_lo + t_lo
+    sum_hi = sums[sum_cat]
+
+    c_lo_for_sum = c_lo
+    g_hi = (sum_hi - c_lo_for_sum - t_lo) // 5 * 5
+    for _ in range(20):
+        arm_budget = g_hi - (g_lo - 20)
+        next_c = max(c_lo_for_sum, cycles_lower_bound_for_budget(pf, recipe, states, arm_budget))
+        next_g_hi = (sum_hi - next_c - t_lo) // 5 * 5
+        if next_c == c_lo_for_sum and next_g_hi == g_hi:
+            break
+        c_lo_for_sum, g_hi = next_c, next_g_hi
+
+    sum_lo = g_lo + c_lo_for_sum + t_lo
     print(sep)
     print(row(f"SUM ({sum_label})", sum_lo, sums))
     print()
     if sum_lo == sums.get(sum_cat, sum_lo + 1):
         print(f"=> {sum_cat} record is PROVEN OPTIMAL.")
     else:
-        sum_hi = sums[sum_cat]
         pct = 100 * (sum_hi - sum_lo) / sum_hi
         print(f"=> Best {sum_cat} record may be improvable by up to "
               f"{sum_hi - sum_lo} ({pct:.1f}%).")
 
     # ── Upper bounds from best SUM record ─────────────────────────────────
 
-    sum_hi = sums[sum_cat]
-    g_hi = (sum_hi - c_lo - t_lo) // 5 * 5  # every part costs a multiple of 5g
     c_hi = sum_hi - g_lo - t_lo
     t_hi = sum_hi - g_lo - c_lo
 
@@ -274,7 +283,7 @@ def _chapter_1_2_pids():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compute proven bounds for the optimal SUM solution.")
-    parser.add_argument("--puzzle", default='P024', metavar="ID",
+    parser.add_argument("--puzzle", default='P007', metavar="ID",
                          help="Puzzle ID (default: run every chapter 1+2 puzzle, P007-P022)")
     args = parser.parse_args()
 

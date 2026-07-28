@@ -11,6 +11,7 @@ import itertools
 import math
 import re
 from collections import Counter, deque
+from typing import Optional
 
 from puzzle_parser import (
     PuzzleFile, ATOM_NAMES,
@@ -378,7 +379,18 @@ def _cadence_latency(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph) ->
     since _path_l_spine only pools the assigned paths' raw_L values —
     "aab" and "aba" score identically, so there's no need to check both),
     and keep the smallest L_spine across every combination, same
-    safe-lower-bound reasoning as the single-path case."""
+    safe-lower-bound reasoning as the single-path case.
+
+    Memoized on `graph` (see StateGraph._cadence_latency_cache): a graph is
+    always built for one specific recipe, and callers — notably solve.py's
+    SUM-tightening loop via cycles_lower_bound_for_budget — invoke this
+    repeatedly with the same (pf, recipe, graph) triple, so recomputing the
+    combinations_with_replacement search over paths on every call is pure
+    waste."""
+    cached = graph._cadence_latency_cache
+    if cached is not None and cached[0] == id(recipe):
+        return cached[1]
+
     products_needed = pf.products_needed()
     period = 1
     for i, count in recipe.reagent_counts.items():
@@ -400,6 +412,7 @@ def _cadence_latency(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph) ->
         L_spine, note = _path_l_spine(pf, recipe, graph, list(assignment), raw_ls_by_path)
         if best is None or L_spine < best[0]:
             best = (L_spine, note)
+    graph._cadence_latency_cache = (id(recipe), best)
     return best
 
 
@@ -541,6 +554,101 @@ def cycles_lower_bound(pf: PuzzleFile, recipe: RecipeResult, states: StateGraph)
             c_lo, c_note = alt_c_lo, alt_c_note + " (mirrored repeat)"
 
     return c_lo, c_note
+
+
+def _min_arm_cost(k: int, N: int) -> Optional[int]:
+    """Minimum gold in arms to deliver >= k reagent grabs within N cycles,
+    combining three purchasable per-stream rate tiers:
+      - 20g: 1 grab per 4 cycles
+      - 30g: 1 grab per 3 cycles
+      - 40g: 1 grab per 2 cycles — two 20g arms cooperating/alternating on
+        *one* stream, the fastest possible for a single stream. Not the
+        same as two *independent* 20g arms (whose summed rate can
+        undershoot N//2 under integer rounding — e.g. N=6: 2*(6//4)=2 but
+        6//2=3), so this is a genuinely distinct purchasable tier.
+    Multiple independent streams (different reagent positions) can each be
+    bought at whichever tier is cheapest for their share of the aggregate
+    demand k, rates simply adding. None if N < 2, where no tier delivers
+    anything at all.
+
+    Empirically validated against the Opus Magnum leaderboard archive
+    (12345ieee/om-leaderboard-archive, filtered to overlap-glitch
+    submissions): this cost never exceeded any of the 47 campaign puzzles'
+    true cheapest-at-fastest-legitimate-cycles record."""
+    if k <= 0:
+        return 0
+    rate20, rate30, rate40 = N // 4, N // 3, N // 2
+
+    best = None
+    max_n40 = (k // rate40 + 1) if rate40 > 0 else 0
+    for n40 in range(max_n40 + 1):
+        after40 = k - n40 * rate40
+        max_n30 = (after40 // rate30 + 1) if rate30 > 0 and after40 > 0 else 0
+        for n30 in range(max_n30 + 1):
+            remaining = after40 - n30 * rate30
+            if remaining <= 0:
+                n20 = 0
+            elif rate20 > 0:
+                n20 = -(-remaining // rate20)  # ceil division
+            else:
+                continue  # 20g arms deliver nothing at this N; can't close the gap
+            cost = n40 * 40 + n30 * 30 + n20 * 20
+            if best is None or cost < best:
+                best = cost
+    return best
+
+
+def cycles_lower_bound_for_budget(pf: PuzzleFile, recipe: RecipeResult, states: StateGraph,
+                                   arm_budget: int) -> int:
+    """The minimum cycles achievable by any solution whose arm spend is
+    within `arm_budget` gold, needing to deliver as many reagent grabs as
+    `recipe` calls for (see _min_arm_cost). This is *not* a sound
+    unconditional per-metric floor the way cycles_lower_bound is — it's
+    only valid conditioned on a cost budget derived from somewhere already
+    sound. Used solely to tighten the SUM interval in solve.py (arm_budget
+    there comes from a SUM-record-derived cost ceiling minus
+    cost_lower_bound's own non-arm cost floor), never as a substitute for
+    the standalone cycles (c) bound.
+
+    cycles_lower_bound is N (throughput) + L (latency/spine) — arm_budget
+    only constrains N (how much parallel grabbing you can afford), not L
+    (the longest sequential reaction/bond chain, which doesn't get shorter
+    just because you have fewer arms), so this has to add the *same* L
+    cycles_lower_bound_single would, not return the budget-constrained N
+    alone — otherwise it's comparing N_budget against the unrelated N+L
+    and could produce a tightened value that's actually too low to be safe
+    to take a max against.
+
+    _min_arm_cost(k, N) is non-increasing in N (more cycles to work with
+    never makes a given throughput harder to afford), so the smallest N
+    with cost <= arm_budget is found by doubling to bracket then binary
+    search."""
+    k = sum(count for count in recipe.reagent_counts.values() if count > 0)
+
+    L, spine_note = _cadence_latency(pf, recipe, states)
+    all_repeating = all(any(a.type == ATOM_REPEAT for a in mol.atoms) for mol in pf.outputs)
+    if not all_repeating:
+        L += 1  # last drop isn't pipelined away unless every output repeats
+
+    if k <= 0 or arm_budget < 20:
+        return L
+
+    def affordable(n):
+        cost = _min_arm_cost(k, n)
+        return cost is not None and cost <= arm_budget
+
+    lo = 1
+    while not affordable(lo):
+        lo *= 2
+    hi = lo
+    lo = 1 if lo == 1 else lo // 2 + 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if affordable(mid):
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo + L
 
 
 def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
