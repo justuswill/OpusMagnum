@@ -2,76 +2,62 @@
 schematic.py — backward state-space search from a puzzle's output molecule(s)
 down toward its raw reagents.
 
-Builds on the atom-count-level recipe (stoichiometry.solve_recipe) by adding molecule
-*structure*: each state is a list of Molecule objects (atoms on the hex grid,
-same representation puzzle_parser uses everywhere else) plus how many
-firings of each transformation reaction are still available. Starting from
-one unit copy of the output molecule(s), two kinds of moves generate predecessor states:
+Builds on the atom-count-level recipe (stoichiometry.solve_recipe) by adding
+molecule *structure*: each state is a list of Molecule objects (same
+hex-grid representation puzzle_parser uses) plus how many firings of each
+transformation reaction remain. Starting from one unit copy of the output
+molecule(s), two moves generate predecessor states:
 
-  - un-bond: remove one existing bond. If it was a bridge, the molecule
-    splits into two (the list grows by one); if it was a ring-closing edge,
-    the molecule just loses that bond and stays in one piece.
+  - un-bond: remove one existing bond. A bridge splits the molecule into
+    two; a ring-closing edge just drops the bond and stays in one piece.
   - un-react: reverse one firing of an available reaction — remove the
-    atoms on its product side (matching types/counts) from wherever they
-    sit in the current state, and add new, freshly-spawned, unbonded atoms
-    for its reagent side. Spends one unit of that reaction's remaining
-    budget.
+    product-side atoms (matching types/counts) from wherever they sit,
+    add fresh unbonded atoms for the reagent side, and spend one unit of
+    that reaction's budget.
 
-A BFS from the initial state, following every neighbor, enumerates every
-combination of unbond/un-react moves reachable within the reaction budget —
-i.e. every structurally-distinct way the recipe's atom bookkeeping could
-have been assembled, without yet committing to geometry/cycle timing (still
-out of scope here, same as stoichiometry.py) — with one exception: a third
-kind of move, "wait" (_wait_neighbors), ages every free atom below
-_READY_AGE by one, modeling the real idle cycles a drop-and-create
-reaction's product atom needs before it's old enough to be picked up again
-(see _READY_AGE / Atom.age) — everything else about the state is untouched.
+A BFS from the initial state enumerates every combination of unbond/un-react
+moves reachable within the reaction budget — every structurally-distinct
+way the recipe's atom bookkeeping could have been assembled, without
+committing to geometry/cycle timing (out of scope here, as in
+stoichiometry.py) — plus a third move, "wait" (_wait_neighbors), which ages
+every free atom below _READY_AGE by one, modeling the idle cycles a
+drop-and-create reaction's product atom needs before it can be picked up
+again (_READY_AGE / Atom.age); nothing else about the state changes.
 
-Termination: every unbond/un-react move strictly decreases (total bonds
-across all molecules) + (total reactions_left) — unbond removes one bond
-(triple-bond reversal removes three at once) and never adds any; un-react
-spends one unit of budget and the atoms it adds are always unbonded. "wait"
-is the one move that leaves that sum unchanged, but it strictly decreases a
-second, lexicographically-following measure — sum of (_READY_AGE - age)
-over every free atom below _READY_AGE — and is never offered at all once
-that's already zero (see _wait_neighbors), so the lexicographic pair
-(bonds+reactions_left, age deficit) still strictly decreases on every move,
-bounded below by (0, 0): the state graph is still a finite DAG and the BFS
-still always terminates.
+Termination: every unbond/un-react move strictly decreases (total bonds) +
+(total reactions_left) — unbond removes bonds and adds none; un-react
+spends budget and only adds unbonded atoms. "wait" leaves that sum
+unchanged but strictly decreases a second measure, sum of
+(_READY_AGE - age) over free atoms below _READY_AGE, and is never offered
+once that's already zero (_wait_neighbors) — so the pair
+(bonds+reactions_left, age deficit) strictly decreases every move, bounded
+below by (0, 0): the graph is a finite DAG and the BFS always terminates.
 
-Simplifications (deliberately out of scope for this module):
-  - An un-react move relabels its *first* consumed atom in place (keeping
-    its position and bonds, matching how a transformation glyph actually
-    works — the atom doesn't detach from its molecule) and turns it into the
-    reaction's first produced type. Any *additional* atoms the reaction
-    needs beyond that one (e.g. purification's second lo atom, or
-    projection's separately-needed quicksilver) have no real position yet,
-    so they're spawned as a fresh single-atom molecule at local (0, 0).
-    Where a transformation glyph would actually put multiple simultaneous
-    inputs/outputs is a geometry/choreography question (PLAN.md Phase A/B),
-    not a stoichiometric one — this is a simplification, not a claim that
-    every atom in a multi-atom reaction ends up in the geometrically correct
-    place relative to the others.
-  - Catalyst atoms (stoichiometry.Reaction.catalyst) aren't modeled here —
-    solve_recipe already verified a catalyst-supplying reagent exists before
-    handing us reaction_unit_counts, so every budgeted firing is assumed
-    usable.
-  - State dedup uses a color-refinement graph signature (a few rounds of
-    "recolor each atom by its own + its neighbors' colors"), not a true
-    graph-isomorphism test — enough to collapse the overwhelming majority of
-    symmetric duplicates (e.g. which of several identical salt atoms a move
-    picked) without the cost of exact canonicalization; pathologically
-    symmetric molecules could in rare cases be treated as distinct when
-    they're actually isomorphic.
+Simplifications (deliberately out of scope):
+  - An un-react move relabels its *first* consumed atom in place (position
+    and bonds kept, matching how a glyph doesn't detach the atom) into the
+    reaction's first produced type. Any additional needed atoms (e.g.
+    purification's second lo atom, projection's quicksilver) spawn as a
+    fresh single-atom molecule at (0, 0) — real multi-atom placement is a
+    geometry/choreography question (PLAN.md Phase A/B), not modeled here.
+  - Catalyst atoms (Reaction.catalyst) aren't modeled — solve_recipe
+    already verified a catalyst-supplying reagent exists before handing us
+    reaction_unit_counts, so every budgeted firing is assumed usable.
+  - State dedup uses a color-refinement graph signature, not exact
+    graph-isomorphism — collapses the overwhelming majority of symmetric
+    duplicates without exact-canonicalization cost; pathologically
+    symmetric molecules could rarely be treated as distinct when isomorphic.
 
     ASSUMPTIONS:
-    reaction_counts // ouputs_needed is sufficient to create optimal path
+    reaction_counts // outputs_needed is sufficient to create optimal path
+    the optimal path contains no more reactions than necessary
+    - minimal number of unbonding reactions
 """
 
 from collections import Counter, deque
 from dataclasses import dataclass, replace
 from itertools import combinations, product as iproduct
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 from puzzle_parser import (
     PuzzleFile, Molecule, Atom, Bond, ATOM_NAMES,
@@ -116,25 +102,11 @@ class StateGraph:
     def __init__(self):
         self.states: List[State] = []
         self.edges: Dict[int, List[int]] = {}
-        self.edge_move: Dict[Tuple[int, int], str] = {}  # (from_idx, to_idx) -> move label
-        self._index: Dict[tuple, int] = {}  # canonical signature -> index
-        self.input_state_idx: int = None  # set by reachable_states: input_state_indices[0], kept for display
-        # Every state matching the actual raw reagents (see reachable_states)
-        # — molecule_signature (unlike _state_signature) doesn't look at
-        # Atom.age, so structurally-identical raw-reagent states can still
-        # end up as distinct graph nodes differing only in how much a free
-        # atom has "waited" (see _READY_AGE) along whichever path reached
-        # them. A genuine raw-reagent grab has no readiness requirement of
-        # its own, so bounds.py's path search must be free to start from
-        # *any* of them and take whichever gives the best result, not just
-        # the first one this BFS happened to discover.
+        self.edge_move: Dict[Tuple[int, int], str] = {}
+        self._index: Dict[tuple, int] = {}
+        self.input_state_idx: int = None
+        # list, can have different atom ages
         self.input_state_indices: List[int] = []
-        # Memo for bounds._cadence_latency: (id(recipe), result), since a
-        # graph is always built by reachable_states(pf, recipe) for one
-        # specific recipe, and solve.py's SUM-tightening loop calls into it
-        # repeatedly with that same (pf, recipe, graph) triple — recomputing
-        # the same combinatorial path search on every iteration otherwise.
-        self._cadence_latency_cache: Optional[Tuple[int, tuple]] = None
 
     def add_state(self, state: State, key: tuple) -> int:
         idx = len(self.states)
@@ -240,6 +212,93 @@ _HEX_DIRS = [(1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1)]
 _DIR_INDEX = {d: i for i, d in enumerate(_HEX_DIRS)}
 
 
+def _rotate60(u: int, v: int, cu: int, cv: int, k: int) -> Tuple[int, int]:
+    """(u, v) rotated k*60° counterclockwise about center (cu, cv), on this
+    module's axial hex coordinates — derived from _HEX_DIRS being a
+    60°-consecutive direction cycle: the linear map (u, v) -> (u+v, -u)
+    sends each _HEX_DIRS entry to the next one, so it's exactly one 60°
+    step; applying it k times is a k*60° rotation."""
+    du, dv = u - cu, v - cv
+    for _ in range(k % 6):
+        du, dv = du + dv, -du
+    return cu + du, cv + dv
+
+
+def _molecule_rotational_group(mol: Molecule) -> Tuple[List[List[int]], List[Dict[int, int]]]:
+    """(orbits, perms): orbits partitions mol's atom indices into
+    equivalence classes under mol's own rotational symmetry (the largest
+    found); perms is the list of nonidentity atom_idx -> atom_idx maps, one
+    per nonzero rotation mapping mol onto itself exactly (same atom type at
+    each position, same bonds). Rotations only, never reflections:
+    molecule_signature is chirality-sensitive (mirror images get different
+    signatures on purpose), so a mirror symmetry wouldn't make its two
+    paired atoms interchangeable for pooling the way a rotation does
+    (relabeling one vs. the other gives an actual mirror image, not an
+    identical result).
+
+    A nontrivial rotation has exactly one fixed point (its center), so
+    candidate centers are restricted to mol's own atom positions — an
+    off-atom center could only fix the molecule if no atom needs to map to
+    itself, which doesn't arise for the puzzles this targets. Returns the
+    identity-only (all-singleton orbits, no perms) result if no atom
+    position yields a nontrivial symmetry.
+
+    Not memoized on `mol`'s identity, for the same reason as
+    molecule_signature: measured with an id-keyed cache on
+    P025/P033/P034/P036 with no measurable improvement (within run-to-run
+    noise, if anything slightly negative) — most calls are for distinct
+    molecule content, not repeated hits on the same reference."""
+    pos_to_idx = {(a.u, a.v): i for i, a in enumerate(mol.atoms)}
+    bond_set = {(frozenset({(b.from_u, b.from_v), (b.to_u, b.to_v)}), b.type) for b in mol.bonds}
+
+    best_perms: List[Dict[int, int]] = []
+    for a0 in mol.atoms:
+        cu, cv = a0.u, a0.v
+        perms = []
+        for k in range(1, 6):
+            perm = {}
+            ok = True
+            for i, a in enumerate(mol.atoms):
+                nu, nv = _rotate60(a.u, a.v, cu, cv, k)
+                j = pos_to_idx.get((nu, nv))
+                if j is None or mol.atoms[j].type != a.type:
+                    ok = False
+                    break
+                perm[i] = j
+            if not ok:
+                continue
+            new_bonds = {(frozenset({_rotate60(b.from_u, b.from_v, cu, cv, k),
+                                      _rotate60(b.to_u, b.to_v, cu, cv, k)}), b.type)
+                         for b in mol.bonds}
+            if new_bonds == bond_set:
+                perms.append(perm)
+        if len(perms) > len(best_perms):
+            best_perms = perms
+
+    n = len(mol.atoms)
+    if not best_perms:
+        return [[i] for i in range(n)], []
+
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for perm in best_perms:
+        for i, j in perm.items():
+            ri, rj = find(i), find(j)
+            if ri != rj:
+                parent[ri] = rj
+
+    groups: Dict[int, List[int]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    return list(groups.values()), best_perms
+
+
 def _directed_adjacency(atoms: List[Atom], bonds: List[Bond]) -> Dict[int, List[Tuple[int, int, int]]]:
     """atom index -> list of (hex direction index 0-5, bond.type bitmask,
     neighbor atom index) for each bond, direction taken from that atom's own
@@ -291,11 +350,19 @@ def molecule_signature(mol: Molecule, rounds: int = 4) -> tuple:
     """Rotation/translation/atom-order-invariant fingerprint via a few
     rounds of color refinement (Weisfeiler-Leman style) — see module
     docstring for why this is a heuristic, not an exact isomorphism test.
-    Bond *directions and kinds* (not just which atoms are bonded) feed into
-    each round via _cyclic_canonical, so e.g. an X-Y-X chain where the two X
-    neighbors sit 60°/120°/180° apart at Y gets a different signature for
-    each angle, a normal bond vs. any triplex color is never conflated with
-    another, and mirror-image arrangements are kept distinct too."""
+    Bond *directions and kinds* feed into each round via _cyclic_canonical,
+    so e.g. an X-Y-X chain with its two X neighbors 60°/120°/180° apart at
+    Y gets a different signature per angle, normal vs. triplex-color bonds
+    are never conflated, and mirror-image arrangements stay distinct too.
+
+    Deliberately *not* memoized on `mol`'s identity, despite being the
+    hottest function in the whole search and despite _apply_mixed_actions
+    reusing the same Molecule reference for untouched molecules — measured
+    on P025/P033 with an id-keyed cache: consistently 6-11% *slower* end to
+    end. Most calls are for genuinely distinct molecule content (freshly
+    constructed, not shared references), so the hit rate is too low to pay
+    for the lookup/store overhead. Left unmemoized rather than caching for
+    cache's own sake."""
     n = len(mol.atoms)
     if n == 0:
         return ()
@@ -336,17 +403,44 @@ def _state_signature(state: State, tracked_types: frozenset) -> tuple:
 
 # ── neighbor generation ───────────────────────────────────────────────────
 
-# Move-kind labels attached to each edge. Reaction moves use the reaction's
-# own name as the label. Preference ranking (lower = preferred) used when
-# the same target state is reachable via more than one kind of move — plain
-# bond preferred over triple-bond, per instruction; reaction moves default
-# to the middle since no preference was specified for them.
 _MOVE_BOND = "bond"
 _MOVE_BOND_R = "bond_r"
 _MOVE_BOND_K = "bond_k"
 _MOVE_BOND_Y = "bond_y"
 _MOVE_TRIPLE_BOND = "triple-bond"
 _TRIPLEX_COLOR_LABEL = {BOND_TRIPLEX_R: _MOVE_BOND_R, BOND_TRIPLEX_K: _MOVE_BOND_K, BOND_TRIPLEX_Y: _MOVE_BOND_Y}
+
+
+class BondAction(NamedTuple):
+    """One elementary bond-removal action (see _elementary_bond_actions):
+    `touched` is the set of (mol_idx, atom_idx) pairs it grabs (used to
+    check two actions combined into one move never share an atom);
+    `remove_by_mol` maps molecule_idx -> set of (bond index into that
+    molecule's bonds list, bit to clear from that bond's type) pairs —
+    clearing a bit only drops the bond entry entirely once its type
+    reaches 0 (see _apply_mixed_actions)."""
+    label: str
+    touched: frozenset
+    remove_by_mol: Dict[int, set]
+
+
+class ReactionAction(NamedTuple):
+    """One elementary un-react firing (see _elementary_reaction_actions):
+    `touched` == frozenset(firing). `firing` is the list of (mol_idx,
+    atom_idx) atom instances this firing consumes — firing[0] is the atom
+    relabeled in place (see _apply_mixed_actions); any further entries are
+    extra co-reagents removed outright. `add_types` is the reaction's
+    (already alternative-resolved, see _reverse_reaction_options) list of
+    produced types — add_types[0] becomes firing[0]'s new type in place,
+    add_types[1:] are spawned as fresh free atoms."""
+    label: str
+    touched: frozenset
+    name: str
+    firing: List[Tuple[int, int]]
+    add_types: List[int]
+
+
+Action = Union[BondAction, ReactionAction]
 
 
 def _move_priority(move: str) -> int:
@@ -377,15 +471,10 @@ def _bonds_by_direction(atoms: List[Atom], bonds: List[Bond]) -> Dict[int, Dict[
     return result
 
 
-# The two possible orientations of a triple-bond (multi-bonder) glyph
-# centered on one atom: bonded to 3 neighbors simultaneously at alternating,
-# 120°-apart directions — {0,2,4} or {1,3,5}. omsim/sim.c's MULTI_BONDING
-# footprint ({1,0},{0,-1},{-1,1} relative to the center) is exactly the
-# {0,2,4} case; {1,3,5} is the other rotation.
 _TRIPLE_DIRECTION_SETS = [(0, 2, 4), (1, 3, 5)]
 
 
-def _elementary_bond_actions(state: State, parts_available: int) -> List[Tuple[str, frozenset, Dict[int, set]]]:
+def _elementary_bond_actions(state: State, parts_available: int) -> List[BondAction]:
     """Every individual bonding action currently reversible in `state`: one
     single-bond removal (reverse of a Bonder — needs PART_BONDER, normal
     bonds only, label "bond"), or one single-*color* triplex removal
@@ -395,18 +484,11 @@ def _elementary_bond_actions(state: State, parts_available: int) -> List[Tuple[s
     full triplex bond in one move, only one color per pass. Or one
     triple-bond removal (reverse of a Multi-bonder, needs PART_BONDER_SPEED
     — 2 or 3 bonds around one atom, whichever of a qualifying triple's
-    slots are occupied; only ever normal bonds).
-
-    Each action is (move_label, touched_atoms, remove_by_mol):
-    touched_atoms is the set of (molecule_idx, atom_idx) pairs the action
-    grabs — used to check that two actions combined into one move never
-    share an atom (an atom can only be part of one bonding action at a
-    time — this is also exactly why two different colors of the *same*
-    triplex bond can never combine into one move: they touch the same pair
-    of atoms). remove_by_mol maps molecule_idx -> set of (bond index into
-    that molecule's bonds list, bit to clear from that bond's type) pairs
-    the action removes — clearing a bit only drops the bond entry entirely
-    once its type reaches 0 (see _apply_bond_removal)."""
+    slots are occupied; only ever normal bonds). See BondAction for field
+    meanings — touched is used to check that two actions combined into one
+    move never share an atom (this is also exactly why two different
+    colors of the *same* triplex bond can never combine into one move:
+    they touch the same pair of atoms)."""
     actions = []
     for mi, mol in enumerate(state.molecules):
         pos_to_index = {(a.u, a.v): i for i, a in enumerate(mol.atoms)}
@@ -417,11 +499,11 @@ def _elementary_bond_actions(state: State, parts_available: int) -> List[Tuple[s
                 continue
             touched = frozenset({(mi, ai), (mi, aj)})
             if b.is_normal and (parts_available & PART_BONDER):
-                actions.append((_MOVE_BOND, touched, {mi: {(bi, BOND_NORMAL)}}))
+                actions.append(BondAction(_MOVE_BOND, touched, {mi: {(bi, BOND_NORMAL)}}))
             if parts_available & PART_BONDER_PRISMA:
                 for color, label in _TRIPLEX_COLOR_LABEL.items():
                     if b.type & color:
-                        actions.append((label, touched, {mi: {(bi, color)}}))
+                        actions.append(BondAction(label, touched, {mi: {(bi, color)}}))
 
         if parts_available & PART_BONDER_SPEED:
             by_dir = _bonds_by_direction(mol.atoms, mol.bonds)
@@ -441,8 +523,8 @@ def _elementary_bond_actions(state: State, parts_available: int) -> List[Tuple[s
                         neighbor_ai = pos_to_index.get(neighbor_pos)
                         if neighbor_ai is not None:
                             touched.add((mi, neighbor_ai))
-                    actions.append((_MOVE_TRIPLE_BOND, frozenset(touched),
-                                     {mi: {(k, BOND_NORMAL) for k in bond_indices}}))
+                    actions.append(BondAction(_MOVE_TRIPLE_BOND, frozenset(touched),
+                                               {mi: {(k, BOND_NORMAL) for k in bond_indices}}))
     return actions
 
 
@@ -457,50 +539,175 @@ def _freshly_freed(components: List[Molecule]) -> List[Molecule]:
     ]
 
 
-def _apply_bond_removal(state: State, remove_by_mol: Dict[int, set]) -> List[Molecule]:
-    """remove_by_mol maps molecule_idx -> set of (bond index, bit to clear)
-    pairs (see _elementary_bond_actions) — clearing a bit only drops a bond
-    entry entirely once its type reaches 0, so removing one color from a
-    multi-color triplex bond leaves the other colors' connection intact."""
-    new_molecules = []
-    for mi, mol in enumerate(state.molecules):
-        removals = remove_by_mol.get(mi)
-        if not removals:
-            new_molecules.append(mol)
-            continue
-        clear_bits: Dict[int, int] = {}
-        for bi, bit in removals:
-            clear_bits[bi] = clear_bits.get(bi, 0) | bit
-        new_bonds = []
-        for bi, b in enumerate(mol.bonds):
-            bits = clear_bits.get(bi, 0)
-            if not bits:
-                new_bonds.append(b)
-                continue
-            new_type = b.type & ~bits
-            if new_type:
-                new_bonds.append(replace(b, type=new_type))
-        new_molecules.extend(_freshly_freed(_split_molecule(mol.atoms, new_bonds)))
-    return new_molecules
-
-
 _SINGLE_BOND_MOVES = {_MOVE_BOND, _MOVE_BOND_R, _MOVE_BOND_K, _MOVE_BOND_Y}
 
 
 def _unbond_neighbors(state: State, parts_available: int) -> List[Tuple[State, str]]:
     """One single-bond removal (normal, or one triplex color) at a time —
     see _elementary_bond_actions."""
-    return [(State(_apply_bond_removal(state, remove_by_mol), dict(state.reactions_left)), label)
-            for label, _touched, remove_by_mol in _elementary_bond_actions(state, parts_available)
-            if label in _SINGLE_BOND_MOVES]
+    return [(_apply_mixed_actions(state, [a]), a.label)
+            for a in _elementary_bond_actions(state, parts_available)
+            if a.label in _SINGLE_BOND_MOVES]
 
 
 def _triple_unbond_neighbors(state: State, parts_available: int) -> List[Tuple[State, str]]:
     """One triple-bond (multi-bonder) removal at a time — see
     _elementary_bond_actions."""
-    return [(State(_apply_bond_removal(state, remove_by_mol), dict(state.reactions_left)), label)
-            for label, _touched, remove_by_mol in _elementary_bond_actions(state, parts_available)
-            if label == _MOVE_TRIPLE_BOND]
+    return [(_apply_mixed_actions(state, [a]), a.label)
+            for a in _elementary_bond_actions(state, parts_available)
+            if a.label == _MOVE_TRIPLE_BOND]
+
+
+def _bond_orbit_bundles(local_actions: List[BondAction], group: List[int],
+                         perms: List[Dict[int, int]]) -> List[List[BondAction]]:
+    """Every atom-disjoint subset of one molecule's own bond-action rotation
+    orbit `group` (indices into `local_actions` — see _bond_pool_catalogs),
+    one representative per equivalence class under the orbit's own local
+    rotation action, exactly the same canonicalize-by-min-over-perms
+    approach _orbit_source_allocations uses for atom colorings. Removing
+    bond A vs. its rotation-equivalent bond B (or the same choice of
+    several) yields isomorphic results (same molecule_signature) since the
+    molecule's own rotation maps one onto the other — so only one subset
+    per class needs generating, not all of them. Orbit size is bounded by
+    the rotation group's order (at most 6, orbit-stabilizer theorem), so
+    brute-forcing all 2^d subsets stays cheap. The empty subset (bundle=[])
+    is a real, needed yield — see _orbit_source_allocations for why: other
+    independent catalogs need to be able to combine with "this orbit fires
+    nothing"."""
+    d = len(group)
+    pos_of = {gi: p for p, gi in enumerate(group)}
+    key_to_local = {(local_actions[gi].touched, local_actions[gi].label): gi for gi in group}
+
+    local_perms = []
+    for perm in perms:
+        mapping = [None] * d
+        ok = True
+        for p, gi in enumerate(group):
+            a = local_actions[gi]
+            mapped = frozenset((m, perm[ai]) for m, ai in a.touched)
+            partner = key_to_local.get((mapped, a.label))
+            if partner is None:
+                ok = False
+                break
+            mapping[p] = pos_of[partner]
+        if ok:
+            local_perms.append(tuple(mapping))
+
+    bundles = []
+    seen_canonical = set()
+    for mask in range(1 << d):
+        subset = tuple(p for p in range(d) if mask & (1 << p))
+        touched_union = set()
+        disjoint = True
+        for p in subset:
+            t = local_actions[group[p]].touched
+            if t & touched_union:
+                disjoint = False
+                break
+            touched_union |= t
+        if not disjoint:
+            continue
+        canon = min([subset] + [tuple(sorted(perm[p] for p in subset)) for perm in local_perms])
+        if canon in seen_canonical:
+            continue
+        seen_canonical.add(canon)
+        bundles.append([local_actions[group[p]] for p in subset])
+    return bundles
+
+
+def _bond_pool_catalogs(state: State, parts_available: int, get_orbits=None,
+                         exclude_molecules: frozenset = frozenset()
+                         ) -> Tuple[List[BondAction], List[List[List[BondAction]]]]:
+    """Splits state's elementary bond-removal actions (_elementary_bond_actions)
+    into (remaining, catalogs): `remaining` has no rotational partner and
+    goes through the caller's exact combinations() scan unchanged; `catalogs`
+    has one joint entry per molecule with any poolable orbit — all of that
+    molecule's size-2+ orbits combined and canonicalized together by
+    _bond_orbit_bundles, then combined via iproduct the same way
+    _combined_bond_reaction_neighbors already combines its reaction
+    catalogs. Turns e.g. 15 simultaneously-removable, mostly-symmetric bonds
+    from a 2^15 scan into a handful of small per-molecule products.
+
+    Orbits must be joined per molecule, not canonicalized one at a time:
+    if rotation r swaps both {a0,a1} and {b0,b1} at once, canonicalizing
+    each independently only ever offers {a0,b0} (and its isomorphic image
+    {a1,b1}) — never the genuinely distinct {a0,b1}, which silently
+    vanishes. Joining into one group of 4 before canonicalizing recovers it
+    (verified by a targeted brute-force case plus a full differential sweep
+    against the pre-pooling baseline).
+
+    `get_orbits`, if given, reuses the caller's own mi -> (orbits, perms)
+    cache instead of recomputing _molecule_rotational_group.
+
+    `exclude_molecules` sidesteps the same bug one level up: a molecule
+    that also feeds a reaction's pool catalog has its reaction choices
+    canonicalized independently of its bond choices under the same
+    rotation group, so cross-joining the two drops the same mismatched-
+    rotation combos. Falling back to exact bond enumeration for just those
+    molecules avoids it — an exhaustive axis combined with a reduced one
+    doesn't lose anything, only two independently-reduced axes do."""
+    if get_orbits is None:
+        _cache: Dict[int, tuple] = {}
+
+        def get_orbits(mi):
+            if mi not in _cache:
+                _cache[mi] = _molecule_rotational_group(state.molecules[mi])
+            return _cache[mi]
+
+    actions = _elementary_bond_actions(state, parts_available)
+    by_mol: Dict[int, List[int]] = {}
+    for idx, a in enumerate(actions):
+        mi = next(iter(a.touched))[0]
+        by_mol.setdefault(mi, []).append(idx)
+
+    remaining: List[BondAction] = []
+    catalogs: List[List[List[BondAction]]] = []
+
+    for mi, idxs in by_mol.items():
+        if len(state.molecules[mi].atoms) < 2 or mi in exclude_molecules:
+            remaining.extend(actions[i] for i in idxs)
+            continue
+        _atom_orbits, perms = get_orbits(mi)
+        if not perms:
+            remaining.extend(actions[i] for i in idxs)
+            continue
+
+        local_actions = [actions[i] for i in idxs]
+        key_to_local = {(a.touched, a.label): pos for pos, a in enumerate(local_actions)}
+        n = len(local_actions)
+        parent = list(range(n))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for pos, a in enumerate(local_actions):
+            for perm in perms:
+                mapped = frozenset((m, perm[ai]) for m, ai in a.touched)
+                partner = key_to_local.get((mapped, a.label))
+                if partner is not None:
+                    rp, rq = find(pos), find(partner)
+                    if rp != rq:
+                        parent[rp] = rq
+
+        groups: Dict[int, List[int]] = {}
+        for pos in range(n):
+            groups.setdefault(find(pos), []).append(pos)
+
+        # All of this molecule's size-2+ orbits joined into ONE group before
+        # canonicalizing (see docstring) — not one catalog per orbit.
+        joint_group: List[int] = []
+        for group in groups.values():
+            if len(group) < 2:
+                remaining.append(local_actions[group[0]])
+            else:
+                joint_group.extend(group)
+        if joint_group:
+            catalogs.append(_bond_orbit_bundles(local_actions, joint_group, perms))
+
+    return remaining, catalogs
 
 
 def _combined_bond_neighbors(state: State, parts_available: int) -> List[Tuple[State, str]]:
@@ -516,32 +723,49 @@ def _combined_bond_neighbors(state: State, parts_available: int) -> List[Tuple[S
     triple-bond centered on x never reaches z (it's not adjacent to x), and
     a plain bond removal on x-y already uses y, blocking a simultaneous y-z
     action in that same move — the two bonds have to be reversed one at a
-    time instead."""
-    actions = _elementary_bond_actions(state, parts_available)
+    time instead.
+
+    Rotationally-interchangeable actions (see _bond_pool_catalogs) are
+    pooled rather than run through the exact combinations() scan below —
+    only actions with no symmetry partner go through it directly, same
+    split reaction-action pooling already uses."""
+    actions, catalogs = _bond_pool_catalogs(state, parts_available)
     n = len(actions)
-    neighbors_out = []
-    for size in range(2, n + 1):
+    individual_subsets = [[]]
+    for size in range(1, n + 1):
         for combo in combinations(range(n), size):
             touched_union = set()
             disjoint = True
             for idx in combo:
-                touched = actions[idx][1]
+                touched = actions[idx].touched
                 if touched & touched_union:
                     disjoint = False
                     break
                 touched_union |= touched
             if not disjoint:
                 continue
-            remove_by_mol: Dict[int, set] = {}
-            labels = []
-            for idx in combo:
-                label, _touched, per_mol = actions[idx]
-                labels.append(label)
-                for mi, bis in per_mol.items():
-                    remove_by_mol.setdefault(mi, set()).update(bis)
-            move = f"{size}x{labels[0]}" if all(l == labels[0] for l in labels) else "+".join(labels)
-            new_molecules = _apply_bond_removal(state, remove_by_mol)
-            neighbors_out.append((State(new_molecules, dict(state.reactions_left)), move))
+            individual_subsets.append([actions[idx] for idx in combo])
+
+    neighbors_out = []
+    for pool_choice in iproduct(*catalogs) if catalogs else [()]:
+        pool_bundle = [a for bundle in pool_choice for a in bundle]
+        for ind_subset in individual_subsets:
+            total = pool_bundle + ind_subset
+            if len(total) < 2:
+                continue  # size 0/1 already covered by _unbond_neighbors/_triple_unbond_neighbors
+            touched_union = set()
+            ok = True
+            for a in total:
+                if a.touched & touched_union:
+                    ok = False
+                    break
+                touched_union |= a.touched
+            if not ok:
+                continue
+            labels = [a.label for a in total]
+            move = (f"{len(total)}x{labels[0]}" if all(l == labels[0] for l in labels)
+                    else "+".join(labels))
+            neighbors_out.append((_apply_mixed_actions(state, total), move))
     return neighbors_out
 
 
@@ -573,63 +797,76 @@ def _reverse_reaction_options(r: Reaction) -> Tuple[List[int], List[List[int]]]:
     return remove_types, [[alt] for alt in r.alt_reagent]
 
 
-def _elementary_reaction_actions(state: State, reactions: Dict[str, Reaction]) -> List[Tuple[str, frozenset, tuple]]:
-    """Every single un-react firing (one reaction, one specific choice of
-    atom instances, one choice of which alternative type to relabel to if
-    the reaction is a combined "X_or_Y" one — see _reverse_reaction_options)
-    currently available, in the same (label, touched_atoms, payload) shape
-    _elementary_bond_actions uses so both can feed the same atom-disjoint
-    combiner (see _combined_bond_reaction_neighbors) — payload is
-    ("reaction", name, chosen, add_types) instead of a bond-removal dict.
-    Only k=1 firings: batching several firings of the *same* reaction
-    together is still _reaction_neighbors' own job (it composes with itself
-    more directly); this exists so a firing can combine with bonds or with
-    a *different* reaction, which neither existing path can produce."""
+def _elementary_actions_for_name(state: State, reactions: Dict[str, Reaction], name: str) -> List[ReactionAction]:
+    """Every single k=1 un-react firing of `name` currently available and
+    legal (see _firing_atoms_ok), one action per (alternative type, choice
+    of atom instances) — one ReactionAction per literal instance-level
+    combination, the same shape _elementary_bond_actions' BondAction uses
+    so both can feed the same atom-disjoint combiner (see
+    _combined_bond_reaction_neighbors). Used both for reactions that can
+    never be pooled by that combiner's per-type catalogs (multi-atom
+    firings, space-limited ones — see _elementary_reaction_actions) and as
+    the exact fallback for a poolable-shaped name whose candidates this
+    state conflict with one of those."""
+    actions = []
+    r = reactions[name]
+    remove_types, add_type_options = _reverse_reaction_options(r)
+    for add_types in add_type_options:
+        # A combined "X_or_Y" reaction's move label should show which
+        # concrete alternative this action actually used, not the umbrella
+        # group name.
+        display_name = f"calcify_{ATOM_NAMES[add_types[0]]}" if r.alt_reagent else name
+        for chosen in _choose_instances(state, remove_types):
+            if not _firing_atoms_ok(state, name, chosen):
+                continue
+            actions.append(ReactionAction(display_name, frozenset(chosen), name, chosen, add_types))
+    return actions
+
+
+def _elementary_reaction_actions(state: State, reactions: Dict[str, Reaction]) -> List[ReactionAction]:
+    """Every instance-level ReactionAction for a reaction that can never be
+    pooled by _combined_bond_reaction_neighbors' per-type catalogs: a
+    multi-atom firing (group_size > 1, several co-reagents need pairing up)
+    or a space-limited one (projection's free-hex bookkeeping, see
+    _is_space_limited) — both stay individually/exactly enumerated there.
+    Single-atom, non-space-limited reactions are handled by that function's
+    catalogs directly from `state` instead of being materialized here first
+    (see its docstring) — this only covers what's left."""
     actions = []
     for name, budget in state.reactions_left.items():
         if budget <= 0:
             continue
-        r = reactions[name]
-        remove_types, add_type_options = _reverse_reaction_options(r)
-        for add_types in add_type_options:
-            # See _reaction_neighbors: a combined "X_or_Y" reaction's move
-            # label should show which concrete alternative this action
-            # actually used, not the umbrella group name.
-            display_name = f"calcify_{ATOM_NAMES[add_types[0]]}" if r.alt_reagent else name
-            for chosen in _choose_instances(state, remove_types):
-                if not _firing_atoms_ok(state, name, chosen):
-                    continue
-                actions.append((display_name, frozenset(chosen), ("reaction", name, chosen, add_types)))
+        remove_types, _add_type_options = _reverse_reaction_options(reactions[name])
+        if len(remove_types) == 1 and not _is_space_limited(name):
+            continue  # handled by _combined_bond_reaction_neighbors' catalogs instead
+        actions.extend(_elementary_actions_for_name(state, reactions, name))
     return actions
 
 
-def _apply_mixed_actions(state: State, chosen: list) -> State:
-    """Apply a combo of atom-disjoint elementary actions — some bonding
-    actions (payload: {mol_idx: {(bond index, bit to clear), ...}}, from
-    _elementary_bond_actions), some reaction firings (payload: ("reaction",
-    name, firing, add_types), from _elementary_reaction_actions, add_types
-    already resolved to whichever alternative that action picked — see
-    _reverse_reaction_options) — simultaneously. Each firing relabels its
-    own first consumed atom in place and removes/spawns the rest, exactly
-    like a lone _reaction_neighbors firing; bond removals just drop bonds
-    — see both for the individual rules this only combines."""
+def _apply_mixed_actions(state: State, chosen: List[Action]) -> State:
+    """Apply a combo of atom-disjoint elementary actions — some BondActions,
+    some ReactionActions (add_types already resolved to whichever
+    alternative that action picked — see _reverse_reaction_options) —
+    simultaneously. Each firing relabels its own first consumed atom in
+    place and removes/spawns the rest; bond removals just drop bonds. The
+    sole place either kind of action is actually applied to a state — every
+    neighbor-generating function builds action bundles and calls this."""
     bond_remove_by_mol: Dict[int, set] = {}
     relabel_by_mol: Dict[int, Dict[int, tuple]] = {}  # ai -> (new_type, is_drop_and_create)
     extra_remove_by_mol: Dict[int, set] = {}
     spawn_types = []
     reaction_uses: Counter = Counter()
 
-    for _label, _touched, payload in chosen:
-        if isinstance(payload, tuple) and payload[0] == "reaction":
-            _, name, firing, add_types = payload
-            reaction_uses[name] += 1
-            r_mi, r_ai = firing[0]
-            relabel_by_mol.setdefault(r_mi, {})[r_ai] = (add_types[0], _is_drop_and_create(name))
-            for mi, ai in firing[1:]:
+    for action in chosen:
+        if isinstance(action, ReactionAction):
+            reaction_uses[action.name] += 1
+            r_mi, r_ai = action.firing[0]
+            relabel_by_mol.setdefault(r_mi, {})[r_ai] = (action.add_types[0], _is_drop_and_create(action.name))
+            for mi, ai in action.firing[1:]:
                 extra_remove_by_mol.setdefault(mi, set()).add(ai)
-            spawn_types.extend(add_types[1:])
+            spawn_types.extend(action.add_types[1:])
         else:
-            for mi, bis in payload.items():
+            for mi, bis in action.remove_by_mol.items():
                 bond_remove_by_mol.setdefault(mi, set()).update(bis)
 
     new_molecules = []
@@ -644,9 +881,9 @@ def _apply_mixed_actions(state: State, chosen: list) -> State:
         new_atoms = list(mol.atoms)
         for ai, (new_type, is_dc) in relabels.items():
             old = new_atoms[ai]
-            # See _reaction_neighbors: a plain relabel carries the atom's
-            # age over (same atom, continuous existence); a drop-and-create
-            # reversal starts both sides fresh (genuine creation boundary).
+            # A plain relabel carries the atom's age over (same atom,
+            # continuous existence); a drop-and-create reversal starts both
+            # sides fresh (genuine creation boundary).
             new_atoms[ai] = Atom(type=new_type, u=old.u, v=old.v, age=0 if is_dc else old.age)
         # removed_bonds is a set of (bond index, bit to clear) pairs (see
         # _elementary_bond_actions) — clearing a bit only drops a bond
@@ -669,8 +906,8 @@ def _apply_mixed_actions(state: State, chosen: list) -> State:
             result = _remove_atoms(new_atoms, new_bonds, removed_atoms)
         else:
             result = _split_molecule(new_atoms, new_bonds)
-        # See _reaction_neighbors: a singleton here is only "freshly freed"
-        # (age reset) if it wasn't already free-standing before this move.
+        # A singleton here is only "freshly freed" (age reset) if it wasn't
+        # already free-standing before this move.
         new_molecules.extend(_freshly_freed(result) if len(mol.atoms) > 1 else result)
 
     for atype in spawn_types:
@@ -683,55 +920,345 @@ def _apply_mixed_actions(state: State, chosen: list) -> State:
     return State(new_molecules, new_reactions_left)
 
 
+def _reaction_pool_key(state: State, reactions: Dict[str, Reaction], name: str):
+    """(atype, add_type_options) if `name`'s single-atom reversal actions
+    are poolable — safe to enumerate by *how many* (and *which kind of*)
+    fire rather than materializing "which literal atom" per action first
+    (see _atype_reaction_catalog) — else None. Requires group_size 1 (a
+    lone atom in, no co-reagents to pair up) and not space-limited
+    (projection still needs its own free-hex bookkeeping per firing, so
+    stays in the exact/individual path)."""
+    r = reactions[name]
+    remove_types, add_type_options = _reverse_reaction_options(r)
+    if len(remove_types) != 1 or _is_space_limited(name):
+        return None
+    return remove_types[0], add_type_options
+
+
+def _free_source_allocations(reactions: Dict[str, Reaction], candidates: List[Tuple[int, int]],
+                              name_group: list, remaining_budget: Dict[str, int]):
+    """Every joint way to split however many of `candidates` (0..len, all
+    free-standing atoms of one shared type) go to each (name, alternative)
+    in `name_group`, each name capped by remaining_budget[name] — yields
+    (bundle, used), used mapping name -> how many candidates it claimed.
+
+    Firing N of these free, same-type, single-atom, non-space-limited
+    reversals together always yields the same resulting state no matter
+    *which* N of the type's free instances are chosen — molecule_signature
+    (state dedup's canonical key, see _state_signature) only sees each
+    result's type, not its identity or board position (freshly spawned
+    atoms are literally born at a dummy (0, 0) — see _apply_mixed_actions).
+    So instead of the exponentially-many raw combinations of "which atom"
+    per firing, this counts: how many go to each (name, alternative) — a
+    composition problem, polynomial in len(candidates) rather than
+    exponential in it."""
+    M = len(candidates)
+
+    def alt_splits(total, n_alts):
+        if n_alts == 1:
+            yield (total,)
+            return
+        for first in range(total + 1):
+            for rest in alt_splits(total - first, n_alts - 1):
+                yield (first,) + rest
+
+    def rec(i, remaining):
+        if i == len(name_group):
+            yield [], {}
+            return
+        name, add_type_options = name_group[i]
+        cap = min(remaining_budget.get(name, 0), remaining)
+        for t in range(cap + 1):
+            for split in alt_splits(t, len(add_type_options)):
+                for rest_alloc, rest_used in rec(i + 1, remaining - t):
+                    used = dict(rest_used)
+                    if t:
+                        used[name] = used.get(name, 0) + t
+                    yield [(name, add_type_options, split)] + rest_alloc, used
+
+    for allocation, used in rec(0, M):
+        offset = 0
+        bundle = []
+        for name, add_type_options, split in allocation:
+            r = reactions[name]
+            for add_types, k in zip(add_type_options, split):
+                display_name = f"calcify_{ATOM_NAMES[add_types[0]]}" if r.alt_reagent else name
+                for _ in range(k):
+                    mi, ai = candidates[offset]
+                    offset += 1
+                    firing = [(mi, ai)]
+                    bundle.append(ReactionAction(display_name, frozenset(firing), name, firing, add_types))
+        yield bundle, used
+
+
+def _orbit_source_allocations(reactions: Dict[str, Reaction], mi: int, orbit: List[int],
+                               perms: List[Dict[int, int]], name_group: list,
+                               remaining_budget: Dict[str, int]):
+    """Every canonical coloring of `orbit`'s atoms (all bonded inside
+    molecule `mi`, all matching name_group's shared consumed type — orbits
+    are always type-homogeneous, since a valid rotation requires matching
+    types at every mapped position) among {unfired} + {(name, alternative)
+    for every name in name_group and each alternative}, respecting each
+    name's remaining_budget, one representative per equivalence class
+    under the molecule's own rotation group `perms`. Yields (bundle, used)
+    like _free_source_allocations.
+
+    A rotation mapping the whole molecule onto itself also maps "coloring
+    C" onto "coloring rotate(C)", giving both an identical (rotation-
+    invariant) molecule_signature, so only one representative per class
+    needs generating. Orbit size is bounded by the rotation group's order
+    (at most 6, orbit-stabilizer theorem), so this stays cheap even
+    brute-forced — a single-atom orbit is the degenerate d=1 case, where
+    every coloring is already its own class, reducing to ordinary
+    singleton-action enumeration."""
+    d = len(orbit)
+    orbit_index = {ai: pos for pos, ai in enumerate(orbit)}
+    local_perms = []
+    for perm in perms:
+        local = [None] * d
+        ok = True
+        for pos, ai in enumerate(orbit):
+            j = perm.get(ai)
+            if j is None or j not in orbit_index:
+                ok = False
+                break
+            local[pos] = orbit_index[j]
+        if ok:
+            local_perms.append(tuple(local))
+
+    # symbol 0 = unfired; symbols 1.. = one per (name index, alternative index)
+    alphabet: List[Tuple[Optional[int], Optional[int]]] = [(None, None)]
+    for ni, (_name, add_type_options) in enumerate(name_group):
+        for alt_idx in range(len(add_type_options)):
+            alphabet.append((ni, alt_idx))
+    n_symbols = len(alphabet)
+
+    seen_canonical = set()
+    for coloring in iproduct(range(n_symbols), repeat=d):
+        counts: Dict[str, int] = {}
+        over_budget = False
+        for c in coloring:
+            ni, _alt_idx = alphabet[c]
+            if ni is None:
+                continue
+            name = name_group[ni][0]
+            counts[name] = counts.get(name, 0) + 1
+            if counts[name] > remaining_budget.get(name, 0):
+                over_budget = True
+                break
+        if over_budget:
+            continue
+        canon = min([coloring] + [tuple(coloring[p] for p in perm) for perm in local_perms])
+        if canon in seen_canonical:
+            continue
+        seen_canonical.add(canon)
+        # The all-unfired coloring is a real, needed yield here (bundle=[],
+        # used={}) — not filtered as a no-op the way a single source's
+        # local dedup might suggest: _atype_reaction_catalog's joint
+        # recursion over multiple sources needs every source, including
+        # this one, to be able to explicitly contribute nothing so other
+        # sources can independently contribute something (see
+        # _free_source_allocations' t=0 case, which yields the same way).
+        bundle = []
+        used: Dict[str, int] = {}
+        for pos, c in enumerate(canon):
+            ni, alt_idx = alphabet[c]
+            if ni is None:
+                continue
+            name, add_type_options = name_group[ni]
+            add_types = add_type_options[alt_idx]
+            r = reactions[name]
+            display_name = f"calcify_{ATOM_NAMES[add_types[0]]}" if r.alt_reagent else name
+            ai = orbit[pos]
+            firing = [(mi, ai)]
+            bundle.append(ReactionAction(display_name, frozenset(firing), name, firing, add_types))
+            used[name] = used.get(name, 0) + 1
+        yield bundle, used
+
+
+def _atype_reaction_catalog(state: State, reactions: Dict[str, Reaction], name_group: list, sources: list):
+    """Every joint allocation across ALL of a shared atom type's candidate
+    `sources` (each ("free", candidates) or ("orbit", mi, orbit, perms) —
+    see _free_source_allocations / _orbit_source_allocations) for every
+    reaction name in `name_group` that consumes this type, as (bundle,
+    has_reaction) pairs ready to feed _apply_mixed_actions alongside
+    individually-enumerated actions. Each name's own reactions_left budget
+    is shared across *every* source that offers it — sources are processed
+    in sequence, each source's own usage reducing the remaining budget the
+    next source sees, so e.g. a name with both free-standing and
+    orbit-bonded candidates this state can draw from both without
+    over-firing."""
+    budgets = {name: state.reactions_left.get(name, 0) for name, _add_type_options in name_group}
+
+    def rec(idx, remaining_budget):
+        if idx == len(sources):
+            yield [], {}
+            return
+        source = sources[idx]
+        if source[0] == "free":
+            gen = _free_source_allocations(reactions, source[1], name_group, remaining_budget)
+        else:
+            _kind, mi, orbit, perms = source
+            gen = _orbit_source_allocations(reactions, mi, orbit, perms, name_group, remaining_budget)
+        for bundle, used in gen:
+            next_remaining = dict(remaining_budget)
+            for name, u in used.items():
+                next_remaining[name] -= u
+            for rest_bundle, rest_used in rec(idx + 1, next_remaining):
+                combined_used = dict(used)
+                for name, u in rest_used.items():
+                    combined_used[name] = combined_used.get(name, 0) + u
+                yield bundle + rest_bundle, combined_used
+
+    for bundle, _used in rec(0, budgets):
+        yield bundle, bool(bundle)
+
+
 def _combined_bond_reaction_neighbors(state: State, parts_available: int,
                                        reactions: Dict[str, Reaction]) -> List[Tuple[State, str]]:
-    """Atom-disjoint combos that mix bonding actions with reaction firings
-    (or different reactions with each other) into one simultaneous move —
-    the gap _combined_bond_neighbors (bonds only) and _reaction_neighbors
-    (same-reaction-name firings only) leave: an atom can be part of at most
-    one bonding action or one reaction firing per move, but nothing stops
-    unrelated glyphs elsewhere in the molecule from firing in the same
-    cycle. Restricted to combos containing at least one reaction firing —
-    all-bond combos are already _combined_bond_neighbors' job. Projection
-    firings additionally need a free hex each (_is_space_limited) — several
-    can still combine, just only as many as there are distinct free hexes
-    to put results in."""
-    bond_actions = _elementary_bond_actions(state, parts_available)
-    reaction_actions = _elementary_reaction_actions(state, reactions)
-    all_actions = bond_actions + reaction_actions
-    n = len(all_actions)
-    reaction_indices = set(range(len(bond_actions), n))
+    """Every reaction-firing move: a lone firing, several simultaneous
+    firings of one reaction, or an atom-disjoint combo of bonding actions
+    with reaction firings / different reactions. The *only* generator of
+    reaction-firing moves in this module — single and same-name-simultaneous
+    firings are just the size-1/single-name cases of this combinatorics,
+    not a separate path. Projection firings additionally need a free hex
+    each (_is_space_limited) — several can combine, just only as many as
+    there are distinct free hexes.
+
+    Single-atom, non-space-limited reversals — the vast majority of
+    available reaction actions in a typical state — are never materialized
+    as raw per-instance actions: for each atom type such a reaction
+    consumes, every current candidate (free-standing, or bonded inside a
+    rotationally-symmetric molecule — _molecule_rotational_group) is
+    grouped into one shared "how many, of which kind, fire" catalog
+    (_atype_reaction_catalog) up front, class/orbit-native rather than
+    enumerated instance-by-instance and pooled after the fact. 30
+    simultaneously-reversible single-atom reactions would otherwise blow
+    up the exact scan below to 2^30. Multi-atom firings, space-limited
+    ones, and bonded targets with no orbit symmetry stay in that exact
+    scan — as does any type whose catalog would need to share a reaction's
+    budget with a conflicting non-poolable action of the same type (a
+    multi-atom or space-limited reaction also touching a free atom of that
+    type): simpler and safer to fall back to exact enumeration than risk a
+    physical atom being claimed twice.
+
+    Bond-removal actions get the same treatment via _bond_pool_catalogs,
+    merged into the same `pool_catalogs` list: a symmetric molecule's
+    interchangeable bonds are pooled by equivalence class instead of
+    joining the exact scan, same rationale as the reaction case."""
+    individual_reaction_actions = _elementary_reaction_actions(state, reactions)
+
+    blocked_types = set()
+    for action in individual_reaction_actions:
+        for mi, ai in action.touched:
+            if len(state.molecules[mi].atoms) == 1:
+                blocked_types.add(state.molecules[mi].atoms[0].type)
+
+    pool_names_by_type: Dict[int, list] = {}
+    for name, budget in state.reactions_left.items():
+        if budget <= 0:
+            continue
+        key = _reaction_pool_key(state, reactions, name)
+        if key is None:
+            continue
+        atype, add_type_options = key
+        pool_names_by_type.setdefault(atype, []).append((name, add_type_options, _is_drop_and_create(name)))
+
+    pool_catalogs = []
+    molecule_orbits_cache: Dict[int, tuple] = {}
+    reaction_orbit_molecules: set = set()
+
+    def get_orbits(mi):
+        if mi not in molecule_orbits_cache:
+            molecule_orbits_cache[mi] = _molecule_rotational_group(state.molecules[mi])
+        return molecule_orbits_cache[mi]
+
+    for atype, name_group_raw in pool_names_by_type.items():
+        dc_flags = {is_dc for _name, _add_types, is_dc in name_group_raw}
+        if atype in blocked_types or len(dc_flags) > 1:
+            for name, _add_types, _is_dc in name_group_raw:
+                individual_reaction_actions.extend(_elementary_actions_for_name(state, reactions, name))
+            continue
+
+        is_dc = dc_flags.pop()
+        name_group = [(name, add_type_options) for name, add_type_options, _is_dc in name_group_raw]
+
+        free_candidates = [(mi, 0) for mi, mol in enumerate(state.molecules)
+                            if len(mol.atoms) == 1 and mol.atoms[0].type == atype
+                            and (not is_dc or mol.atoms[0].age >= _READY_AGE)]
+        sources = [("free", free_candidates)] if free_candidates else []
+        if not is_dc:
+            for mi, mol in enumerate(state.molecules):
+                if len(mol.atoms) < 2:
+                    continue
+                orbits, perms = get_orbits(mi)
+                matching = [ai for orbit in orbits for ai in orbit if mol.atoms[ai].type == atype]
+                if matching:
+                    sources.append(("orbit", mi, matching, perms))
+                    reaction_orbit_molecules.add(mi)
+
+        if not sources:
+            continue
+        pool_catalogs.append(list(_atype_reaction_catalog(state, reactions, name_group, sources)))
+
+    bond_actions, bond_catalogs = _bond_pool_catalogs(state, parts_available, get_orbits=get_orbits,
+                                                        exclude_molecules=reaction_orbit_molecules)
+    pool_catalogs.extend([[(bundle, False) for bundle in catalog] for catalog in bond_catalogs])
+
+    individual_actions: List[Action] = bond_actions + individual_reaction_actions
+    n = len(individual_actions)
     occupied = _occupied_positions(state)
 
-    neighbors_out = []
-    for size in range(2, n + 1):
+    individual_subsets = [[]]
+    for size in range(1, n + 1):
         for combo in combinations(range(n), size):
-            if reaction_indices.isdisjoint(combo):
-                continue  # pure-bond combo, already covered by _combined_bond_neighbors
             touched_union = set()
             disjoint = True
             for idx in combo:
-                touched = all_actions[idx][1]
+                touched = individual_actions[idx].touched
                 if touched & touched_union:
                     disjoint = False
                     break
                 touched_union |= touched
             if not disjoint:
                 continue
+            chosen = [individual_actions[idx] for idx in combo]
+            name_counts = Counter(a.name for a in chosen if isinstance(a, ReactionAction))
+            if any(count > state.reactions_left.get(name, 0) for name, count in name_counts.items()):
+                continue
+            individual_subsets.append(chosen)
+
+    neighbors_out = []
+    for pool_choice in iproduct(*pool_catalogs) if pool_catalogs else [()]:
+        pool_bundle = [a for bundle, _has in pool_choice for a in bundle]
+        pool_has_reaction = any(has for _bundle, has in pool_choice)
+        for ind_subset in individual_subsets:
+            total = pool_bundle + ind_subset
+            has_reaction = pool_has_reaction or any(isinstance(a, ReactionAction) for a in ind_subset)
+            if not has_reaction:
+                continue
+
+            touched_union = set()
+            ok = True
+            for a in total:
+                if a.touched & touched_union:
+                    ok = False
+                    break
+                touched_union |= a.touched
+            if not ok:
+                continue
 
             space_anchors = []
-            for idx in combo:
-                label, _touched, payload = all_actions[idx]
-                if isinstance(payload, tuple) and payload[0] == "reaction" and _is_space_limited(payload[1]):
-                    mi, ai = payload[2][0]
+            for a in total:
+                if isinstance(a, ReactionAction) and _is_space_limited(a.name):
+                    mi, ai = a.firing[0]
                     space_anchors.append((state.molecules[mi].atoms[ai].u, state.molecules[mi].atoms[ai].v))
             if space_anchors and not _has_distinct_free_hexes(space_anchors, occupied):
                 continue
 
-            chosen = [all_actions[idx] for idx in combo]
-            labels = [all_actions[idx][0] for idx in combo]
-            move = f"{size}x{labels[0]}" if all(l == labels[0] for l in labels) else "+".join(labels)
-            neighbors_out.append((_apply_mixed_actions(state, chosen), move))
+            labels = [a.label for a in total]
+            move = f"{len(total)}x{labels[0]}" if all(l == labels[0] for l in labels) else "+".join(labels)
+            neighbors_out.append((_apply_mixed_actions(state, total), move))
     return neighbors_out
 
 
@@ -847,97 +1374,6 @@ def _has_distinct_free_hexes(anchors: List[Tuple[int, int]], occupied: set) -> b
     return all(try_assign(i, set()) for i in range(len(anchors)))
 
 
-def _reaction_neighbors(state: State, reactions: Dict[str, Reaction]) -> List[Tuple[State, str]]:
-    """Reverses 1 up to `budget` firings of a reaction *simultaneously*, in
-    one combined move. The relabeled atom's own position is real, tracked
-    board geometry (see module docstring), so nothing stops several
-    same-named firings at once *except* projection, which additionally
-    needs its own free adjacent hex per firing (_is_space_limited) —
-    everything else has no structural reason to force firings to happen one
-    at a time. Each of the k firings gets its own independent application of
-    the same relabel-in-place rule (its own first consumed atom keeps its
-    own position/bonds and becomes the first produced type; only its own
-    additional atoms, beyond the first, are removed/spawned fresh) — firings
-    never share atoms with each other. Move label is "kxname" for k>1,
-    otherwise plain "name" (unchanged from before)."""
-    neighbors_out = []
-    for name, budget in state.reactions_left.items():
-        if budget <= 0:
-            continue
-        r = reactions[name]
-        remove_types, add_type_options = _reverse_reaction_options(r)
-        group_size = len(remove_types)
-        is_dc = _is_drop_and_create(name)
-        space_limited = _is_space_limited(name)
-        occupied = _occupied_positions(state) if space_limited else None
-        for add_types in add_type_options:
-            # A combined "X_or_Y" reaction's move label should show which
-            # concrete alternative this specific move actually used, not
-            # the umbrella group name — e.g. "calcify_water", not
-            # "calcify_fire_or_water" — since that's what a real solution
-            # would actually be doing at this step.
-            display_name = f"calcify_{ATOM_NAMES[add_types[0]]}" if r.alt_reagent else name
-            for k in range(1, budget + 1):
-                for chosen in _choose_instances(state, remove_types * k):
-                    firings = [chosen[i * group_size:(i + 1) * group_size] for i in range(k)]
-
-                    if not all(_firing_atoms_ok(state, name, firing) for firing in firings):
-                        continue
-
-                    if space_limited:
-                        anchors = [(state.molecules[mi].atoms[ai].u, state.molecules[mi].atoms[ai].v)
-                                   for mi, ai in (firing[0] for firing in firings)]
-                        if not _has_distinct_free_hexes(anchors, occupied):
-                            continue
-
-                    relabel_by_mol: Dict[int, set] = {}
-                    remove_by_mol: Dict[int, set] = {}
-                    for firing in firings:
-                        r_mi, r_ai = firing[0]
-                        relabel_by_mol.setdefault(r_mi, set()).add(r_ai)
-                        for mi, ai in firing[1:]:
-                            remove_by_mol.setdefault(mi, set()).add(ai)
-
-                    new_molecules = []
-                    for mi, mol in enumerate(state.molecules):
-                        relabel_ais = relabel_by_mol.get(mi, set())
-                        extra_remove = remove_by_mol.get(mi, set())
-                        if not relabel_ais and not extra_remove:
-                            new_molecules.append(mol)
-                            continue
-                        new_atoms = list(mol.atoms)
-                        for ai in relabel_ais:
-                            old = new_atoms[ai]
-                            # A plain relabel is the same atom continuing to
-                            # exist (see _firing_atoms_ok) — its age carries
-                            # over. A drop-and-create reversal crosses a
-                            # genuine creation boundary (there's no atom that
-                            # "is" the output), so both sides start fresh.
-                            new_atoms[ai] = Atom(type=add_types[0], u=old.u, v=old.v,
-                                                  age=0 if is_dc else old.age)
-                        if extra_remove:
-                            result = _remove_atoms(new_atoms, mol.bonds, extra_remove)
-                        else:
-                            result = [Molecule(atoms=new_atoms, bonds=list(mol.bonds))]
-                        # A singleton coming out of this is only "freshly
-                        # freed" (age reset, see _freshly_freed) if the atom
-                        # wasn't already free-standing before this move —
-                        # i.e. its original molecule had more than 1 atom.
-                        # Otherwise it's the len==1 relabel-in-place case
-                        # above, whose age decision already stands.
-                        new_molecules.extend(_freshly_freed(result) if len(mol.atoms) > 1 else result)
-
-                    for _ in range(k):
-                        for atype in add_types[1:]:
-                            new_molecules.append(Molecule(atoms=[Atom(type=atype, u=0, v=0, age=0)], bonds=[]))
-
-                    new_reactions_left = dict(state.reactions_left)
-                    new_reactions_left[name] -= k
-                    label = f"{k}x{display_name}" if k > 1 else display_name
-                    neighbors_out.append((State(new_molecules, new_reactions_left), label))
-    return neighbors_out
-
-
 _MOVE_WAIT = "wait"
 
 
@@ -975,18 +1411,17 @@ def neighbors(state: State, reactions: Dict[str, Reaction], parts_available: int
               tracked_types: frozenset) -> List[Tuple[State, str]]:
     """Every (predecessor state, move label) pair reachable from `state` by
     one unbond, one triple-bond (multi-bonder) reversal, any atom-disjoint
-    combination of 2+ of those, one (or several simultaneous, see
-    _reaction_neighbors) un-react move, an atom-disjoint combination of
-    bonding actions with reaction firings / different reactions with each
-    other (see _combined_bond_reaction_neighbors), or one "wait" (see
-    _wait_neighbors) — unbond/triple-bond moves only apply if the puzzle
-    actually grants that glyph. Move label is "bond", "triple-bond",
-    "NxLABEL" for N combined same-kind moves, "label+label" for a mixed
-    combination, "wait", or the reaction name."""
+    combination of 2+ of those, one or several simultaneous un-react moves
+    (alone or atom-disjointly combined with bonding actions / other
+    reactions — see _combined_bond_reaction_neighbors, the sole source of
+    reaction-firing moves), or one "wait" (see _wait_neighbors) —
+    unbond/triple-bond moves only apply if the puzzle actually grants that
+    glyph. Move label is "bond", "triple-bond", "NxLABEL" for N combined
+    same-kind moves, "label+label" for a mixed combination, "wait", or the
+    reaction name."""
     return (_unbond_neighbors(state, parts_available)
             + _triple_unbond_neighbors(state, parts_available)
             + _combined_bond_neighbors(state, parts_available)
-            + _reaction_neighbors(state, reactions)
             + _combined_bond_reaction_neighbors(state, parts_available, reactions)
             + _wait_neighbors(state, tracked_types))
 
@@ -1022,12 +1457,6 @@ def _matches_raw_reagents(state: State, pf: PuzzleFile, recipe: RecipeResult, pr
             continue  # covered by combined_total instead of an exact per-reagent count
         expected[molecule_signature(mol)] += count // products_needed
 
-    # A "raw, directly-needed-by-the-output" atom of a combined type and a
-    # "calcification feedstock" atom of that same type are structurally
-    # identical once fully decomposed — both end up as one standalone
-    # unbonded atom. So the aggregate (exact=False) target isn't the
-    # reaction's count (only the calcified portion), it's the *reagent*
-    # total across the whole group (raw + feedstock together).
     combined_total = None
     if not exact:
         combined_total = sum(count // products_needed for i, count in recipe.reagent_counts.items()
@@ -1056,17 +1485,6 @@ def reachable_states(pf: PuzzleFile, recipe: RecipeResult) -> StateGraph:
     reachable from which."""
     reactions = {r.name: r for r in build_reactions(pf)}
     reactions.update(recipe.extra_reactions)
-    # Only these types ever have their age checked (_firing_atoms_ok, for
-    # reversing a drop-and-create reaction) or matter for the BFS's own
-    # dedup (_state_signature) — every other free atom's age tracking would
-    # just be dead weight multiplying the graph for nothing (see
-    # _wait_neighbors / _state_signature). Restricted to reactions this
-    # puzzle's own recipe actually fires (reaction_counts > 0), not every
-    # drop-and-create reaction build_reactions can construct from the parts
-    # available — e.g. Purification generates one purify_X per consecutive
-    # metal-chain pair regardless of whether this recipe's own chain needs
-    # all of them, and a puzzle without the Glyph of Animismus granted at
-    # all has no reachable way to ever fire (or reverse) it.
     tracked_types = frozenset(
         atype
         for name, r in reactions.items()
@@ -1092,15 +1510,6 @@ def reachable_states(pf: PuzzleFile, recipe: RecipeResult) -> StateGraph:
             graph.add_edge(current_idx, nxt_idx, move)
 
     products_needed = pf.products_needed()
-    # Every state matching (exact=True preferred, see _matches_raw_reagents),
-    # not just the first — molecule_signature ignores Atom.age, so the same
-    # structural raw-reagent state can show up as several distinct graph
-    # nodes differing only in how much "waiting" (_READY_AGE) a free atom
-    # happened to accumulate along whichever path found it. A raw-reagent
-    # grab itself has no readiness requirement, so bounds.py's path search
-    # needs every one of them available to start from, and picks whichever
-    # gives the best (smallest) result — not whichever this BFS discovered
-    # first, which could be an unnecessarily-waited one.
     match_indices = [i for i, s in enumerate(graph.states)
                       if _matches_raw_reagents(s, pf, recipe, products_needed, exact=True)]
     if not match_indices:

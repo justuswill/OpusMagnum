@@ -3,8 +3,8 @@
 Fetch every puzzle tracked by zlbb.faendir.com — campaign, journal (XCIX & CVIII),
 DRM, and community — plus top leaderboard solutions for the key metric categories.
 
-For normal/polymer puzzles: GX (min cost·area), AX (min area·cost),
-                            CX (min cycles·area), SUM (min g+c+a)
+For normal/polymer puzzles: GX (min cost>cycles·area), AX (min area>cost·cycles),
+                            CX (min cycles>cost·area), SUM (min g+c+a)
 For production puzzles:     GX_P, CX_P, SUM_P, IX_P (instructions)
 
 Puzzle files come from the leaderboard's /om/puzzle/{id}/file endpoint.

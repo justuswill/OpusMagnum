@@ -23,7 +23,7 @@ import subprocess
 from puzzle_parser import parse_puzzle, ATOM_NAMES
 from bounds import cycles_lower_bound, cost_lower_bound, area_lower_bound, cycles_lower_bound_for_budget
 from stoichiometry import solve_recipe, solve_recipe_combined, solve_recipe_cheap, describe_molecule
-from schematic import reachable_states
+from schematic_parallel import reachable_states
 
 PUZZLES_DIR = os.path.join(os.path.dirname(__file__), "puzzles")
 OMSIM_BIN   = os.path.join(os.path.dirname(__file__), "omsim", "omsim")
@@ -168,20 +168,17 @@ def main(args):
         recipe = solve_recipe_combined(pf)
         recipe_cheap = solve_recipe_cheap(pf)
     except NotImplementedError:
-        # A flexible reaction group exists but isn't all calcify_* — combining
-        # it isn't supported yet (see solve_recipe_combined), fall back to
-        # solve_recipe's single arbitrary split rather than failing outright.
         recipe = recipe_cheap = solve_recipe(pf)
     print_recipe(pf, recipe)
     print()
-    states = reachable_states(pf, recipe)
+    states = reachable_states(pf, recipe, workers=args.workers, batch_size=args.batch_size)
     # print(states)
     # print()
 
     # ── Analytic lower bounds ─────────────────────────────────────────────
 
     g_lo, g_note = cost_lower_bound(pf, recipe_cheap)
-    c_lo, c_note = cycles_lower_bound(pf, recipe, states)
+    c_lo, c_note = cycles_lower_bound(pf, recipe, states, workers=args.workers, batch_size=args.batch_size)
     if not is_prod:
         t_lo, t_note = area_lower_bound(pf, recipe_cheap)
     else:
@@ -225,7 +222,6 @@ def main(args):
 
     sums = {c: scores[c]["g"] + scores[c]["c"] + scores[c][t_key] for c in present_cats}
     sum_hi = sums[sum_cat]
-
     c_lo_for_sum = c_lo
     g_hi = (sum_hi - c_lo_for_sum - t_lo) // 5 * 5
     for _ in range(20):
@@ -285,12 +281,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compute proven bounds for the optimal SUM solution.")
     parser.add_argument("--puzzle", default='P007', metavar="ID",
                          help="Puzzle ID (default: run every chapter 1+2 puzzle, P007-P022)")
+    parser.add_argument("--workers", type=int, default=None,
+                         help="Worker process count for the state-space search "
+                              "(default: os.process_cpu_count())")
+    parser.add_argument("--batch-size", type=int, default=8,
+                         help="States per worker task (default: 8)")
     args = parser.parse_args()
 
     if args.puzzle is None:
         for pid in _chapter_1_2_pids():
             try:
-                main(argparse.Namespace(puzzle=pid))
+                main(argparse.Namespace(puzzle=pid, workers=args.workers, batch_size=args.batch_size))
             except Exception as e:
                 print(f"Puzzle    : {pid} — skipped ({type(e).__name__}: {e})")
             print()

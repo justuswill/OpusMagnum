@@ -12,6 +12,7 @@ import math
 import re
 from collections import Counter, deque
 from typing import Optional
+from weakref import WeakKeyDictionary
 
 from puzzle_parser import (
     PuzzleFile, ATOM_NAMES,
@@ -24,7 +25,10 @@ from stoichiometry import (
     RecipeResult, METAL_CHAIN, necessary_inputs, describe_molecule,
     solve_recipe, solve_recipe_combined, solve_recipe_cheap,
 )
-from schematic import StateGraph, molecule_signature, reachable_states, _is_drop_and_create
+from schematic import StateGraph, molecule_signature, _is_drop_and_create
+from schematic_parallel import reachable_states
+
+_cadence_latency_memo: "WeakKeyDictionary[StateGraph, tuple]" = WeakKeyDictionary()
 
 
 def _all_paths_nodes(graph: StateGraph, start: int, goal: int) -> list:
@@ -93,53 +97,36 @@ def _path_raw_ls(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph, path: 
 
 def _path_l_spine(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph,
                    paths: list, raw_ls_by_path: dict) -> tuple[int, str]:
-    """L_spine for one period-many assignment of paths, one path per product
-    in the group (period == 1 outside the uneven-split case — see
-    _cadence_latency; each product can walk its own structurally-distinct
-    path, since the real solution isn't required to route every product in
-    a period the same way). Every assigned path's raw_L pool (already
-    computed in raw_ls_by_path, keyed by id(path) — see _path_raw_ls) is
-    appended together per reagent type before the parallel-glyph adjustment.
+    """L_spine for one path assignment (one path per product in the group;
+    period==1 outside the uneven-split case, see _cadence_latency — each
+    product may take a structurally distinct path). Appends each assigned
+    path's raw_L pool (raw_ls_by_path, keyed by id(path); see _path_raw_ls)
+    per reagent type before the parallel-glyph adjustment.
 
-    Parallel-glyph instances of the same type don't stack their raw_L values
-    directly — since `repeats` glyphs jointly supply 1 new molecule every 2
-    cycles (the same cadence N's own formula uses), sort a type's raw_L
-    values descending and subtract 2*(num_blocks - idx//repeats - 1) before
-    taking the max; that's the type's own contribution (a
-    rearrangement-inequality argument: the best possible schedule pairs the
-    earliest-arriving grab with the least-urgent need). num_blocks comes
-    straight from the puzzle's recipe (c.f. cycles_lower_bound's own
-    count/repeats throughput term) scaled by len(paths), since that's
-    exactly how much more total demand there is to spread across the same
-    `repeats` glyphs once several products are grouped into one period.
-    L_spine = max over every reagent type's contribution.
+    Parallel `repeats` glyphs jointly supply 1 new molecule every 2 cycles,
+    so same-type raw_L values don't stack directly: sort a type's values
+    descending and subtract 2*(num_blocks - idx//repeats - 1) before taking
+    the max (rearrangement inequality: earliest-arriving grab pairs with
+    least-urgent need). num_blocks is the recipe's own count/repeats term
+    (see cycles_lower_bound) scaled by len(paths). L_spine is the max over
+    every reagent type's contribution; the displayed "steps that matter"
+    are always the winning path's last L_spine moves (delays compound
+    toward the end).
 
-    Delays inherently compound toward the *end* of the forward process, so
-    the "steps that actually matter" for display are always the last
-    L_spine moves of the winning path (closest to the output), not tied to
-    any particular instance.
+    Only each product's own bottleneck (its max adjusted value) competes
+    for the shared output-drop slot; only one product can drop per cycle,
+    so bottlenecks are sorted ascending and greedily bumped into
+    max(bottleneck, previous_completion + 1) — the standard exchange-
+    argument-optimal schedule for single-resource unit-time scheduling
+    with release times.
 
-    Only each product's own bottleneck (max adjusted value among its own
-    reagent instances) competes for the shared output-drop slot — other,
-    non-maximal grabs within the same product are already accounted for by
-    that product's own max and don't separately queue for anything. Among
-    those per-product bottlenecks, only one product's output can drop per
-    cycle, so ties (or near-ties once queueing compounds them) push later
-    ones out by however many cycles they're stuck behind — the standard
-    exchange-argument-optimal schedule for single-resource unit-time
-    scheduling with release times: sort bottlenecks ascending and greedily
-    bump each into max(bottleneck, previous_completion + 1).
-
-    Which instance lands in which block is itself a choice — pure
-    value-descending order (ignoring which product an instance belongs to)
-    minimizes each sig's own peak in isolation, but can pack several
-    different products' top instances into the very same block, manufacturing
-    queue collisions a p_idx-grouped order (keeping a product's own instances
-    contiguous, so it alone occupies the best block) would avoid. Try the
-    plain value order plus, for k=1..len(paths)-1, keeping p_idx 0..k-1 each
-    in their own sorted group (in p_idx order) with the rest pooled and
-    sorted after — len(paths) candidates total — and keep whichever gives
-    the smallest L_spine."""
+    Which instance lands in which scheduling block is its own choice: pure
+    value-descending order can pack several products' top instances into
+    one block, manufacturing collisions a p_idx-grouped order would avoid.
+    Try plain value order plus, for k=1..len(paths)-1, keeping p_idx
+    0..k-1 each in their own sorted group with the rest pooled after —
+    len(paths) candidates total — and keep whichever gives the smallest
+    L_spine."""
     reagent_sig = _reagent_sig(pf, recipe)
 
     combined = {}
@@ -191,11 +178,6 @@ def _path_l_spine(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph,
     path = paths[p_idx]
     D = len(path) - 1
     moves = [graph.edge_move[(path[k], path[k - 1])] for k in range(1, D + 1)]
-    # Slice by natural_peak (the pre-queueing structural value), not the
-    # already-bumped L_spine — slicing by L_spine here double-counts the
-    # queueing delay: once implicitly (more moves shown than actually
-    # structural) and once explicitly via extra_output_delay below, making
-    # the displayed "=1" terms sum to more than the returned L_spine.
     blocking_moves = moves[max(D - natural_peak, 0):]
     steps = " + ".join(f"{mv}=1" for mv in blocking_moves) if blocking_moves else "already available"
     penalty = L_spine - natural_peak
@@ -241,43 +223,37 @@ def _prune_dominated_paths(paths: list, raw_ls_by_path: dict, reagent_sig: dict)
 
 def _pareto_paths_raw_ls(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph) -> list:
     """Every Pareto-optimal path from any of graph.input_state_indices to
-    the output (node 0), each paired with its already-computed raw_L
-    values — a single BFS/DP that prunes dominated partial paths as it
-    goes, instead of enumerating every path first (potentially exponential
-    — see _all_paths_nodes) and only pruning afterward (see
-    _prune_dominated_paths) once every path's already been walked a second
-    time for its raw_L values (see _path_raw_ls). Kept alongside that older
-    trio (now unused, left in place rather than deleted) in case this
-    combined version needs comparing against or falling back to later.
+    the output (node 0), paired with its raw_L values — a single BFS/DP
+    that prunes dominated partial paths as it walks, instead of
+    enumerating every path first (potentially exponential, see
+    _all_paths_nodes) and pruning afterward (_prune_dominated_paths) after
+    a second walk for raw_L (_path_raw_ls). That older trio is kept unused
+    alongside this one as a fallback/comparison point.
 
-    Walks in graph.edges' own stored direction, starting at the output (0)
-    — the same direction _all_paths_nodes' own DFS already traverses, so no
-    reverse adjacency map is needed. This is chronologically *backward*
-    (undoing moves), which turns out to make raw_L trivial to compute
-    on-line: raw_L for a consumption event is D-k+1, i.e. "1 + how many
-    forward steps remain from this event to the output" — and "how many
-    forward steps remain to the output" is exactly the walk's *backward*
-    distance j from node 0 so far, needing no knowledge of D (the eventual
-    total path length, only known once the walk reaches one of
-    graph.input_state_indices) at all. So each consumption event gets its
-    final raw_L the moment it's discovered, no deferred shift needed.
+    Walks in graph.edges' own direction, starting at the output (0) — same
+    direction _all_paths_nodes' DFS uses, no reverse adjacency needed. This
+    is chronologically backward (undoing moves), which makes raw_L trivial
+    on-line: raw_L for a consumption event is D-k+1 ("1 + forward steps
+    remaining to the output"), and forward-steps-remaining is exactly the
+    walk's backward distance j from node 0 so far — no need to know D (the
+    eventual path length) at all. Each consumption event gets its final
+    raw_L the moment it's discovered.
 
     Domination (a partial path's raw_L-so-far componentwise <= another's,
-    per reagent type) is still safe to prune on early exactly as
-    _prune_dominated_paths reasons for complete paths: both partial paths
-    sit at the same node, so they share every possible remaining suffix,
-    and appending the identical suffix to both preserves the <=.
+    per reagent type) is safe to prune on early for the same reason
+    _prune_dominated_paths reasons about complete paths: both partial paths
+    sit at the same node, share every possible remaining suffix, and
+    appending the identical suffix to both preserves the <=.
 
-    graph.input_state_indices can hold more than one node — molecule_signature
-    (unlike the _state_signature used to dedup the graph itself) ignores
-    Atom.age, so the same structural raw-reagent composition can show up as
-    several distinct nodes differing only in how much a free atom happened
-    to "wait" (see schematic._READY_AGE) along whichever path found it. A
-    genuine raw-reagent grab has no readiness requirement, so every one of
-    them is a legitimate place to start from — collecting results from all
-    of them and letting the usual take-the-minimum logic in _cadence_latency
-    sort out which is best is what actually avoids charging for an
-    unnecessary wait that a different, equally valid start node didn't need."""
+    graph.input_state_indices can hold more than one node: molecule_signature
+    (unlike the graph's own dedup key _state_signature) ignores Atom.age, so
+    the same raw-reagent composition can appear as several distinct nodes
+    differing only in how much a free atom "waited" (schematic._READY_AGE)
+    along the path that found it. A genuine raw-reagent grab has no
+    readiness requirement, so every one is a legitimate start — collecting
+    results from all of them and taking the minimum in _cadence_latency
+    avoids charging for a wait a different, equally valid start didn't
+    need."""
     reagent_sig = _reagent_sig(pf, recipe)
     starts, goal = graph.input_state_indices, 0
 
@@ -313,10 +289,6 @@ def _pareto_paths_raw_ls(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph
     def dominates(a, b):
         return all(x <= y for sig in a for x, y in zip(sorted(a[sig]), sorted(b.get(sig, []))))
 
-    # profile: {sig: [raw_L, ...]} (final values, no deferred shift); path:
-    # node-index list built so far, in backward order (goal first — gets
-    # reversed to forward/start-first order at the end, to match
-    # _all_paths_nodes' return convention); j: backward distance from goal.
     profiles = {goal: [({}, [goal], 0)]}
     for node in order:
         entries = profiles.get(node)
@@ -324,9 +296,6 @@ def _pareto_paths_raw_ls(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph
             continue
         cur_counts = type_counts(node)
         for nxt in graph.edges.get(node, []):
-            # forward direction is nxt (more decomposed, earlier) -> node
-            # (less decomposed, later); the count drop on that forward
-            # step is this backward step's consumption event.
             consumed = type_counts(nxt) - cur_counts
             bucket = profiles.setdefault(nxt, [])
             for profile, path, j in entries:
@@ -359,35 +328,31 @@ def _pareto_paths_raw_ls(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph
 
 
 def _cadence_latency(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph) -> tuple[int, str]:
-    """L_spine across every structurally-distinct path from the raw reagents
-    to the output (see schematic.py; _all_paths_nodes returns them in this
-    forward-chronological order), not just one shortest path: the real
-    optimal solution corresponds to exactly one of these paths, and we
-    don't know which, so the only value provably safe as a lower bound is
-    the smallest L_spine any of them produces — picking a larger one would
-    risk overshooting the true minimum on whichever path the real solution
-    actually follows. See _path_l_spine for the per-path algorithm.
+    """L_spine across every structurally-distinct path from raw reagents to
+    the output (schematic.py's _all_paths_nodes, forward-chronological
+    order), not just the shortest: the real optimal solution follows
+    exactly one of these paths, unknown to us, so only the smallest
+    L_spine any of them produces is a provably safe lower bound — a larger
+    one risks overshooting whichever path the real solution follows. See
+    _path_l_spine for the per-path algorithm.
 
-    When some reagent's per-product demand doesn't split evenly across its
+    When a reagent's per-product demand doesn't split evenly across its
     parallel glyphs, no single product's raw_L pool matches
-    recipe.reagent_counts on its own — the uneven remainder only evens out
-    again after `period` products (e.g. 4 needed per product over 3
-    duplicates: 2/1/1, 1/2/1, 1/1/2, realigning every 3 products). So instead
-    of trying one path per product, we try every length-`period` multiset of
-    paths (each product in the group can route through a different
-    structural path; combinations_with_replacement rather than product
-    since _path_l_spine only pools the assigned paths' raw_L values —
-    "aab" and "aba" score identically, so there's no need to check both),
-    and keep the smallest L_spine across every combination, same
-    safe-lower-bound reasoning as the single-path case.
+    recipe.reagent_counts alone — the remainder only evens out after
+    `period` products (e.g. 4 needed per product over 3 duplicates:
+    2/1/1, 1/2/1, 1/1/2, realigning every 3). So instead of one path per
+    product, try every length-`period` multiset of paths
+    (combinations_with_replacement, not product — _path_l_spine only pools
+    the assigned paths' raw_L values, so "aab" and "aba" score identically),
+    keeping the smallest L_spine across all combinations.
 
-    Memoized on `graph` (see StateGraph._cadence_latency_cache): a graph is
-    always built for one specific recipe, and callers — notably solve.py's
-    SUM-tightening loop via cycles_lower_bound_for_budget — invoke this
-    repeatedly with the same (pf, recipe, graph) triple, so recomputing the
-    combinations_with_replacement search over paths on every call is pure
+    Memoized on `graph` (_cadence_latency_memo, module-level): a graph is
+    built for one specific recipe, and callers — notably solve.py's
+    SUM-tightening loop via cycles_lower_bound_for_budget — call this
+    repeatedly with the same (pf, recipe, graph), so recomputing the
+    combinations_with_replacement search every time would be pure
     waste."""
-    cached = graph._cadence_latency_cache
+    cached = _cadence_latency_memo.get(graph)
     if cached is not None and cached[0] == id(recipe):
         return cached[1]
 
@@ -412,7 +377,7 @@ def _cadence_latency(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph) ->
         L_spine, note = _path_l_spine(pf, recipe, graph, list(assignment), raw_ls_by_path)
         if best is None or L_spine < best[0]:
             best = (L_spine, note)
-    graph._cadence_latency_cache = (id(recipe), best)
+    _cadence_latency_memo[graph] = (id(recipe), best)
     return best
 
 
@@ -469,21 +434,8 @@ def cycles_lower_bound_single(pf: PuzzleFile, recipe: RecipeResult, states: Stat
     N = products_needed
     note = f"output throughput: {products_needed} products, 1/cycle"
 
-    # A combined reaction group's alternative reagents (see
-    # stoichiometry.solve_recipe_combined, e.g. calcify_fire_or_water) can
-    # be grabbed from in parallel — pool their counts/repeats together
-    # rather than checking each independently, or this term stays
-    # bottlenecked on whichever single reagent solve_recipe's arbitrary
-    # split happened to load up, understating real throughput and
-    # producing an unsound (too-large) bound.
     combined_reagent_indices = set()
     for r in recipe.extra_reactions.values():
-        # Only representative reagent indices (recipe.reagent_counts'
-        # keys) — a raw pf.inputs index that's just a duplicate of some
-        # representative isn't its own entry in reagent_group_size, so
-        # .get(i, 1) would silently default it to 1 and double-count it
-        # on top of its representative's own (correct, already-summed)
-        # group_size.
         member_indices = [
             i for i, mol in enumerate(pf.inputs)
             if i in recipe.reagent_counts
@@ -530,13 +482,16 @@ def cycles_lower_bound_single(pf: PuzzleFile, recipe: RecipeResult, states: Stat
     return N + L, f"{note}, {latency_note}"
 
 
-def cycles_lower_bound(pf: PuzzleFile, recipe: RecipeResult, states: StateGraph) -> tuple[int, str]:
+def cycles_lower_bound(pf: PuzzleFile, recipe: RecipeResult, states: StateGraph,
+                        workers: Optional[int] = None, batch_size: int = 8) -> tuple[int, str]:
     """cycles_lower_bound_single(pf), plus — for a repeating output — the same
     computation with the repeat marker(s) mirrored onto the opposite end
     (see puzzle_parser.alternate_repeat_puzzle): a real solution isn't
     required to build the polymer in the direction the puzzle file happens
     to depict, so try both and keep whichever gives the smaller (still
-    sound) bound."""
+    sound) bound. `workers`/`batch_size` only affect the mirrored-repeat
+    side's own reachable_states call (schematic_parallel) — `states` for
+    the primary orientation is passed in already computed."""
     c_lo, c_note = cycles_lower_bound_single(pf, recipe, states)
 
     alt_pf = alternate_repeat_puzzle(pf)
@@ -546,7 +501,7 @@ def cycles_lower_bound(pf: PuzzleFile, recipe: RecipeResult, states: StateGraph)
                 alt_recipe = solve_recipe_combined(alt_pf)
             except NotImplementedError:
                 alt_recipe = solve_recipe(alt_pf)
-            alt_states = reachable_states(alt_pf, alt_recipe)
+            alt_states = reachable_states(alt_pf, alt_recipe, workers=workers, batch_size=batch_size)
             alt_c_lo, alt_c_note = cycles_lower_bound_single(alt_pf, alt_recipe, alt_states)
         except AssertionError:
             alt_c_lo = None
@@ -600,28 +555,25 @@ def _min_arm_cost(k: int, N: int) -> Optional[int]:
 
 def cycles_lower_bound_for_budget(pf: PuzzleFile, recipe: RecipeResult, states: StateGraph,
                                    arm_budget: int) -> int:
-    """The minimum cycles achievable by any solution whose arm spend is
-    within `arm_budget` gold, needing to deliver as many reagent grabs as
-    `recipe` calls for (see _min_arm_cost). This is *not* a sound
-    unconditional per-metric floor the way cycles_lower_bound is — it's
-    only valid conditioned on a cost budget derived from somewhere already
-    sound. Used solely to tighten the SUM interval in solve.py (arm_budget
-    there comes from a SUM-record-derived cost ceiling minus
-    cost_lower_bound's own non-arm cost floor), never as a substitute for
-    the standalone cycles (c) bound.
+    """Minimum cycles for any solution whose arm spend is within
+    `arm_budget` gold, delivering as many reagent grabs as `recipe` needs
+    (see _min_arm_cost). Not a sound unconditional floor like
+    cycles_lower_bound — only valid conditioned on a cost budget already
+    derived soundly. Used solely to tighten solve.py's SUM interval
+    (arm_budget there comes from a SUM-record cost ceiling minus
+    cost_lower_bound's non-arm floor), never as a substitute for the
+    standalone cycles (c) bound.
 
     cycles_lower_bound is N (throughput) + L (latency/spine) — arm_budget
-    only constrains N (how much parallel grabbing you can afford), not L
-    (the longest sequential reaction/bond chain, which doesn't get shorter
-    just because you have fewer arms), so this has to add the *same* L
-    cycles_lower_bound_single would, not return the budget-constrained N
-    alone — otherwise it's comparing N_budget against the unrelated N+L
-    and could produce a tightened value that's actually too low to be safe
-    to take a max against.
+    only constrains N, not L (the longest sequential chain doesn't shorten
+    just because arms are scarcer), so this must add the same L
+    cycles_lower_bound_single would, not return budget-constrained N alone
+    — otherwise it compares N_budget against the unrelated N+L and could
+    produce a tightened value unsafe to max against.
 
-    _min_arm_cost(k, N) is non-increasing in N (more cycles to work with
-    never makes a given throughput harder to afford), so the smallest N
-    with cost <= arm_budget is found by doubling to bracket then binary
+    _min_arm_cost(k, N) is non-increasing in N (more cycles never makes a
+    given throughput harder to afford), so the smallest N with
+    cost <= arm_budget is found by doubling to bracket, then binary
     search."""
     k = sum(count for count in recipe.reagent_counts.values() if count > 0)
 
@@ -678,18 +630,6 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
         return bool(need_keys - have_keys)
 
     needs_elemental = bool((output_atom_types & ELEMENTALS) - input_atom_types)
-
-    # Projection/purification: a missing output metal reachable by climbing
-    # the chain (lead->tin->iron->copper->silver->gold) from an available
-    # input metal. Which specific glyph is actually forced depends on parts
-    # availability and whether quicksilver is around to feed projection
-    # (metal[N]+quicksilver -> metal[N+1]; purification is 2x metal[N] ->
-    # metal[N+1], no quicksilver needed):
-    #   - only one of the two available -> that one is forced
-    #   - both available, no quicksilver anywhere -> projection can't fire,
-    #     so purification is forced
-    #   - both available and quicksilver present -> either would work, so
-    #     the bound can only claim "one of them" (cost/area take the cheaper)
     needs_metal = any(
         m in output_atom_types and m not in input_atom_types
         and any(lower in input_atom_types for lower in METAL_CHAIN[:i])
@@ -713,45 +653,24 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
         "bonder": _new(set(output_normal_bonds), set(input_normal_bonds)),
         "unbonder": _new(input_bonds, output_bonds),
         "bonder_prisma": _new(set(output_triplex_bonds), set(input_triplex_bonds)),
-
-        # Calcification: salt in output, only elemental-type sources available in input
         "calcification": (ATOM_SALT in output_atom_types and ATOM_SALT not in input_atom_types
                            and bool(input_atom_types & ELEMENTALS)),
-
-        # Wheel + duplication: an output elemental (air/earth/fire/water) missing
-        # from every input has no reagent-sourced catalyst atom available for
-        # duplication (salt -> elemental, catalyzed by the elemental itself), so
-        # the wheel's free catalyst becomes mandatory — unless quintessence is
-        # available as an alternate source (dispersion, below).
         "baron_duplication": (
             needs_elemental
             and ATOM_QUINTESSENCE not in input_atom_types
             and bool(pf.parts_available & PART_BARON)
         ),
-
         "metal_glyph": metal_glyph,  # None | "projection" | "purification" | "either"
-
-        # Animismus: vitae or mors in output but not in any input.
         "animismus": (
             (ATOM_VITAE in output_atom_types and ATOM_VITAE not in input_atom_types)
             or (ATOM_MORS in output_atom_types and ATOM_MORS not in input_atom_types)
         ),
-
-        # Dispersion: a missing output elemental whose only other route
-        # (duplication, above) is blocked — the wheel needed for its catalyst
-        # isn't available.
         "dispersion": needs_elemental and not bool(pf.parts_available & PART_BARON),
-
-        # Unification: quintessence in output but not in any input.
         "unification": (ATOM_QUINTESSENCE in output_atom_types
                          and ATOM_QUINTESSENCE not in input_atom_types),
     }
 
-    # Access/Track: animismus/dispersion/unification/purification each have
-    # their own minimum track count, a fixed mechanical requirement to
-    # operate the glyph at all (its ports are spread too far apart for a
-    # single fixed hex to reach) — this applies regardless of whether a
-    # bonder is also in the picture.
+    # Access/Track: animismus/dispersion/unification/purification each have their own minimum track count
     tracks = 0
     if needed["dispersion"]:
         tracks = max(tracks, 2)
@@ -762,24 +681,7 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
     if needed["animismus"]:
         tracks = max(tracks, 4)
 
-    # Once none of bonder, bonder-prisma, or an already-bonded input reagent
-    # is in play (those give the mechanism a richer, non-single-hex shape
-    # this simplified count doesn't model), every reagent the recipe
-    # actually draws from and every output is one point of "access" an arm
-    # has to physically reach — each additional glyph beyond that adds its
-    # own access cost too. A bare arm reaches 6 neighbors for free; each
-    # Track tile (5g) adds another 6, so track count only needs to grow
-    # past whatever minimum was already set above if access still exceeds
-    # that many tracks' worth of reach.
     has_input_bonds = any(mol.bonds for mol in pf.inputs)
-    # A repeat marker isn't a real, separately-reachable zone — the
-    # synthetic single-atom reagent puzzle_parser.py adds for every
-    # repeating-output puzzle only exists so schematic.py's backward search
-    # has something to fully decompose down to, and a repeating *output*'s
-    # repeat atom(s) are produced by the mechanism's own repeating
-    # structure, not something a solution has to separately reach. So any
-    # molecule containing a repeat atom at all — on either side — doesn't
-    # cost an access point.
     access = len({
         i for i, count in recipe.reagent_counts.items()
         if count > 0 and not any(a.type == ATOM_REPEAT for a in pf.inputs[i].atoms)
@@ -797,23 +699,9 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
             access_points["bonder"] = 2
         if needed["bonder_prisma"] and not has_input_bonds:
             access_points["bonder_prisma"] = 2 if not needed["bonder"] else 1
-        # A single-atom reagent only needs its own dedicated access to reach
-        # a bonder if it's actually getting bonded into a bigger output
-        # structure (a multi-atom output) — and only if no *other*,
-        # already-multi-atom input also carries that type in, since that
-        # one would already be positioned to supply the bond for free.
         multi_atom_output_types = {a.type for mol in pf.outputs if len(mol.atoms) > 1
                                     for a in mol.atoms} - {ATOM_REPEAT}
         multi_atom_input_types = {a.type for mol in pf.inputs if len(mol.atoms) > 1 for a in mol.atoms}
-        # A single low-rank metal (e.g. lead) also counts if a *higher*
-        # metal further up METAL_CHAIN (what it becomes after enough
-        # projection/purification firings) is the one actually getting
-        # bonded into a multi-atom output — same reasoning, just one step
-        # removed since the metal changes type along the way. But if some
-        # *other*, already-bonded metal sits anywhere between the two on
-        # the chain (e.g. bonded-in silver, with lead needed and gold in
-        # the output), the chain reaction can carry on from that free
-        # bonded entry point instead — lead doesn't need its own access.
         bondable_single_types = (multi_atom_output_types - multi_atom_input_types) | {
             METAL_CHAIN[idx]
             for idx in range(len(METAL_CHAIN))
@@ -828,8 +716,6 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
         if has_single_atom_input and (needed["bonder"] or needed["bonder_prisma"]):
             access += 1
     if needed["metal_glyph"] == "purification":
-        # Unlike projection, Purification always needs 3 access/tracks
-        # regardless of which branch above applied.
         access_points["metal_glyph"] = 3
     for key, points in access_points.items():
         value = needed[key]
@@ -837,9 +723,6 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
         if present:
             access += points
 
-    # baseline_tracks (the glyph-specific minimum computed above) is a real
-    # board-space requirement — area-costing. Any *further* extension here
-    # is only required if we don't use pistons (as they provide 18 access)
     baseline_tracks = tracks
     if tracks:
         while tracks * 6 < access:
@@ -857,8 +740,7 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
 
 def cost_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
     """
-    Minimum cost based on required parts, plus Track if this puzzle's glyphs
-    outnumber what a bare arm can reach.
+    Minimum cost based on required parts, plus track if this puzzle's glyphs outnumber what a bare arm can reach.
 
     Every solution needs:
       - at least 1 arm (20g)
@@ -887,8 +769,6 @@ def cost_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
 
     refs:
     https://biggieblog.com/optimizing-cost-in-opus-magnum/
-
-    These are hard minimums — a solution with any fewer parts would be invalid.
     """
     needed = _needed_parts(pf, recipe)
 
