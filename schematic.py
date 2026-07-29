@@ -1377,34 +1377,101 @@ def _has_distinct_free_hexes(anchors: List[Tuple[int, int]], occupied: set) -> b
 _MOVE_WAIT = "wait"
 
 
-def _wait_neighbors(state: State, tracked_types: frozenset) -> List[Tuple[State, str]]:
-    """One "wait" move: every free (single-atom-molecule) atom of a
-    `tracked_types` type (the actual product types of this puzzle's
-    drop-and-create reactions — see reachable_states) below _READY_AGE ages
-    by 1 (capped there), nothing else about the state changes. This is how
-    a drop-and-create reaction's product atom (or any atom freshly freed by
-    an unbond — see Atom.age) "matures" enough to be picked back up for
-    another drop-and-create firing (_firing_atoms_ok) — real idle cycles the
-    search has to actually spend, not a free pass. Restricted to
-    tracked_types since age is never checked for any other type — offering
-    a "wait" that only ages an irrelevant atom would just multiply the graph
-    for no reason (see _state_signature). Omitted entirely once nothing
-    would change (every tracked free atom already mature): an edge to the
-    identical state would be a self-loop, which would break the topological
-    order bounds.py's path search relies on and contradicts the module
-    docstring's termination argument (nothing it tracks would be
-    decreasing)."""
+def _age_tracked_atoms(state: State, tracked_types: frozenset,
+                        eligible_ids: Optional[frozenset] = None) -> Optional[State]:
+    """Every free (single-atom-molecule) atom of a `tracked_types` type (the
+    actual product types of this puzzle's drop-and-create reactions — see
+    reachable_states) below _READY_AGE ages by 1 (capped there), nothing
+    else about the state changes. None if nothing would change (every
+    tracked free atom already mature). Split out from _wait_neighbors so
+    _combine_with_wait can layer this same aging on top of an *already
+    computed* bond/reaction move — this is the one piece of state-mutation
+    logic both need, and the "is anything eligible" check has to be
+    identical in both places or the two could disagree on when a "+wait"
+    variant is legal.
+
+    `eligible_ids`, if given, restricts aging to Molecule objects whose
+    `id()` is in that set — see _combine_with_wait for why identity, not
+    position: a move that just created or freed a tracked atom leaves it
+    sitting at age 0 too, at the same dummy spawn coordinate _apply_mixed_actions
+    always uses, so position alone can't tell it apart from a genuinely
+    pre-existing age-0 atom that happens to already be there."""
     changed = False
     new_molecules = []
     for mol in state.molecules:
-        if len(mol.atoms) == 1 and mol.atoms[0].type in tracked_types and mol.atoms[0].age < _READY_AGE:
+        a = mol.atoms[0] if len(mol.atoms) == 1 else None
+        if (a is not None and a.type in tracked_types and a.age < _READY_AGE
+                and (eligible_ids is None or id(mol) in eligible_ids)):
             changed = True
-            new_molecules.append(replace(mol, atoms=[replace(mol.atoms[0], age=mol.atoms[0].age + 1)]))
+            new_molecules.append(replace(mol, atoms=[replace(a, age=a.age + 1)]))
         else:
             new_molecules.append(mol)
     if not changed:
+        return None
+    return State(new_molecules, dict(state.reactions_left))
+
+
+def _wait_neighbors(state: State, tracked_types: frozenset) -> List[Tuple[State, str]]:
+    """One "wait" move, alone: every eligible atom ages by 1 (_age_tracked_atoms)
+    and nothing else about the state changes — modeling the real idle cycles
+    a drop-and-create reaction's product atom (or any atom freshly freed by
+    an unbond — see Atom.age) needs before it "matures" enough to be picked
+    back up for another drop-and-create firing (_firing_atoms_ok). Omitted
+    entirely once nothing would change: an edge to the identical state would
+    be a self-loop, which would break the topological order bounds.py's path
+    search relies on and contradicts the module docstring's termination
+    argument (nothing it tracks would be decreasing)."""
+    aged = _age_tracked_atoms(state, tracked_types)
+    if aged is None:
         return []
-    return [(State(new_molecules, dict(state.reactions_left)), _MOVE_WAIT)]
+    return [(aged, _MOVE_WAIT)]
+
+
+def _combine_with_wait(state: State, moves: List[Tuple[State, str]],
+                        tracked_types: frozenset) -> List[Tuple[State, str]]:
+    """For every (predecessor state, move label) some *other* neighbor
+    function already produced from `state`, also offer the variant where
+    the wait-eligible atoms *already sitting in `state`* age by 1 in that
+    same step — modeling that idle-cycle aging isn't a move of its own
+    competing for the same cycle, it's real elapsed time that keeps passing
+    no matter what else the puzzle's other glyphs are doing simultaneously.
+    Without this, the search could only ever age tracked atoms in a move
+    that does *nothing* else (_wait_neighbors alone), forcing every "do X,
+    then wait for something unrelated to mature" sequence into two separate
+    BFS steps even when X and the aging don't touch a single shared atom —
+    inflating a path's length (and therefore bounds.py's L_spine latency
+    figure) for no real reason.
+
+    Restricted to *the same Molecule objects* already present in `state`
+    *before* `move` ran — not just "whatever's eligible in move's own
+    result" — because a move that itself creates or frees a tracked atom
+    (a fresh drop-and-create product, or a singleton an unbond just split
+    off — both start at age 0, see _apply_mixed_actions/_freshly_freed)
+    would otherwise be indistinguishable from a genuinely pre-existing
+    age-0 atom, letting it tick its first age-step in the very same move
+    it was born — one real cycle's worth of aging manufactured for free.
+    Identity (id()), not position, is what actually distinguishes them:
+    every freshly spawned atom lands at the same dummy (0, 0)
+    _apply_mixed_actions always uses, so position alone can collide with
+    an unrelated, genuinely pre-existing atom that happens to already sit
+    there too — id() can't, since _apply_mixed_actions reuses the exact
+    same object reference for any molecule a move doesn't touch (see its
+    `if not relabels and not removed_bonds and not removed_atoms:
+    new_molecules.append(mol)` fast path) and always constructs a new one
+    for anything it does. An atom `move` *consumes* is simply gone from
+    its result and never considered either way."""
+    eligible_ids = frozenset(
+        id(mol) for mol in state.molecules
+        if len(mol.atoms) == 1 and mol.atoms[0].type in tracked_types and mol.atoms[0].age < _READY_AGE
+    )
+    if not eligible_ids:
+        return []
+    out = []
+    for nxt, move in moves:
+        aged = _age_tracked_atoms(nxt, tracked_types, eligible_ids)
+        if aged is not None:
+            out.append((aged, f"{move}+wait"))
+    return out
 
 
 def neighbors(state: State, reactions: Dict[str, Reaction], parts_available: int,
@@ -1414,16 +1481,19 @@ def neighbors(state: State, reactions: Dict[str, Reaction], parts_available: int
     combination of 2+ of those, one or several simultaneous un-react moves
     (alone or atom-disjointly combined with bonding actions / other
     reactions — see _combined_bond_reaction_neighbors, the sole source of
-    reaction-firing moves), or one "wait" (see _wait_neighbors) —
+    reaction-firing moves), one "wait" alone (_wait_neighbors), or any of
+    the above combined with a simultaneous wait (_combine_with_wait) —
     unbond/triple-bond moves only apply if the puzzle actually grants that
     glyph. Move label is "bond", "triple-bond", "NxLABEL" for N combined
-    same-kind moves, "label+label" for a mixed combination, "wait", or the
-    reaction name."""
-    return (_unbond_neighbors(state, parts_available)
-            + _triple_unbond_neighbors(state, parts_available)
-            + _combined_bond_neighbors(state, parts_available)
-            + _combined_bond_reaction_neighbors(state, parts_available, reactions)
-            + _wait_neighbors(state, tracked_types))
+    same-kind moves, "label+label" for a mixed combination, "wait", the
+    reaction name, or any of those with a trailing "+wait"."""
+    other = (_unbond_neighbors(state, parts_available)
+             + _triple_unbond_neighbors(state, parts_available)
+             + _combined_bond_neighbors(state, parts_available)
+             + _combined_bond_reaction_neighbors(state, parts_available, reactions))
+    return (other
+            + _wait_neighbors(state, tracked_types)
+            + _combine_with_wait(state, other, tracked_types))
 
 
 # ── BFS ────────────────────────────────────────────────────────────────────

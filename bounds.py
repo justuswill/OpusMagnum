@@ -286,8 +286,20 @@ def _pareto_paths_raw_ls(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph
             if remaining[nxt] == 0:
                 queue.append(nxt)
 
-    def dominates(a, b):
-        return all(x <= y for sig in a for x, y in zip(sorted(a[sig]), sorted(b.get(sig, []))))
+    def dominates(a, j_a, b, j_b):
+        """True if `a` (at backward-distance j_a) is at least as good as `b`
+        (j_b) for any shared future suffix. Requires j_a <= j_b (a's future
+        consumption is anchored no worse than b's) and, per type, equal
+        counts so far with each elementwise <= — zip()'s silent truncation
+        on unequal-length lists previously let extra, uncompared entries in
+        b hide a real advantage, wrongly declaring a dominant."""
+        if j_a > j_b:
+            return False
+        for sig in set(a) | set(b):
+            xs, ys = sorted(a.get(sig, [])), sorted(b.get(sig, []))
+            if len(xs) != len(ys) or not all(x <= y for x, y in zip(xs, ys)):
+                return False
+        return True
 
     profiles = {goal: [({}, [goal], 0)]}
     for node in order:
@@ -310,10 +322,10 @@ def _pareto_paths_raw_ls(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph
                 dominated = False
                 survivors = []
                 for other_profile, other_path, other_j in bucket:
-                    if dominated or dominates(other_profile, new_profile):
+                    if dominated or dominates(other_profile, other_j, new_profile, new_j):
                         dominated = True
                         survivors.append((other_profile, other_path, other_j))
-                    elif not dominates(new_profile, other_profile):
+                    elif not dominates(new_profile, new_j, other_profile, other_j):
                         survivors.append((other_profile, other_path, other_j))
                     # else new_profile dominates other_profile: drop other
                 if not dominated:
@@ -425,6 +437,7 @@ def cycles_lower_bound_single(pf: PuzzleFile, recipe: RecipeResult, states: Stat
     ASSUMPTIONS (false)
     - Higher N does not decrease L if using a different sequence of steps.
     - Current recipe has all transformations needed to reach minimum L
+    - minimum period is able to achieve minimum L
 
     refs
     https://biggieblog.com/battling-the-entire-world-in-opus-magnum/
