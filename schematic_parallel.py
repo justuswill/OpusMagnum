@@ -52,7 +52,7 @@ from puzzle_parser import PuzzleFile
 from stoichiometry import RecipeResult, Reaction, build_reactions
 from schematic import (
     StateGraph, State, initial_state, neighbors, _state_signature,
-    _matches_raw_reagents, _is_drop_and_create,
+    _matches_raw_reagents, _is_drop_and_create, _forward_fallback,
 )
 
 # ── worker-process globals, set once via the pool's initializer ───────────
@@ -132,32 +132,6 @@ def reachable_states(pf: PuzzleFile, recipe: RecipeResult, workers: Optional[int
             idx, state = queue.popleft()
             queue.extend(merge(idx, _expand_with(state, reactions, pf.parts_available, tracked_types)))
     else:
-        # Continuous submission, not round/level barriers (see module
-        # docstring for why): `futures` is a standing pool of in-flight
-        # work, not a fixed batch — every time enough futures complete to
-        # free up capacity, newly-discovered states get submitted
-        # immediately, so a worker that finishes early never sits idle
-        # waiting for slower siblings from the same "round." Single-writer
-        # merge is preserved exactly as before: `wait(...,
-        # return_when=FIRST_COMPLETED)` can return several
-        # simultaneously-ready futures at once, but they're always drained
-        # one at a time in this loop, in the main process.
-        #
-        # Batching (`pending` + `_fill`) groups up to `batch_size`
-        # newly-discovered states into one task instead of one task per
-        # state, amortizing the pickling/executor/wait() overhead per task
-        # across several states — worthwhile once a puzzle's states are
-        # individually cheap to expand (so that fixed per-task overhead,
-        # not the actual neighbors() work, dominates wall time). This
-        # doesn't bring back the round-barrier straggler problem: `_fill`
-        # caps *in-flight futures* at `resolved` (one batch-task per
-        # worker), so as soon as any one worker's batch completes it's
-        # immediately handed a fresh batch of whatever's next in `pending`
-        # — a fast worker never waits on a *different* worker's slow batch,
-        # it just keeps consuming its own queue. A worker's own batch can
-        # still contain a mix of cheap and expensive states, but that's the
-        # same variance a single `neighbors()` call already has, not a new
-        # source of stalling.
         pending: deque = deque([(start_idx, start)])
         futures: Dict = {}
 
@@ -186,13 +160,17 @@ def reachable_states(pf: PuzzleFile, recipe: RecipeResult, workers: Optional[int
     if not match_indices:
         match_indices = [i for i, s in enumerate(graph.states)
                           if _matches_raw_reagents(s, pf, recipe, products_needed)]
-    assert match_indices, (
-        f"{pf.name!r}: no reachable state matches the actual raw reagents — "
-        "the un-react/unbond move rules failed to find a valid full "
-        "decomposition path that solve_recipe already proved exists"
-    )
-    graph.input_state_indices = match_indices
-    graph.input_state_idx = match_indices[0]
+    if match_indices:
+        graph.input_state_indices = match_indices
+        graph.input_state_idx = match_indices[0]
+    else:
+        merged = _forward_fallback(pf, recipe, graph, reactions, pf.parts_available,
+                                    tracked_types, products_needed)
+        assert merged, (
+            f"{pf.name!r}: no reachable state matches the actual raw reagents — "
+            "the un-react/unbond move rules failed to find a valid full "
+            "decomposition path that solve_recipe already proved exists"
+        )
     return graph
 
 

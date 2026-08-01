@@ -56,12 +56,13 @@ Simplifications (deliberately out of scope):
 
 from collections import Counter, deque
 from dataclasses import dataclass, replace
+import math
 from itertools import combinations, product as iproduct
-from typing import Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Dict, Iterator, List, NamedTuple, Optional, Tuple, Union
 
 from puzzle_parser import (
     PuzzleFile, Molecule, Atom, Bond, ATOM_NAMES,
-    PART_BONDER, PART_BONDER_PRISMA, PART_BONDER_SPEED,
+    PART_BONDER, PART_BONDER_PRISMA, PART_BONDER_SPEED, PART_UNBONDER,
     BOND_NORMAL, BOND_TRIPLEX_R, BOND_TRIPLEX_K, BOND_TRIPLEX_Y,
 )
 from stoichiometry import RecipeResult, Reaction, build_reactions
@@ -137,14 +138,142 @@ class StateGraph:
         return "\n".join(lines)
 
 
+def _unit_scale(recipe: RecipeResult, products_needed: int) -> int:
+    """Largest divisor of products_needed that also divides every nonzero
+    reagent_counts/reaction_counts value — the real "one unit" size when
+    products_needed doesn't split those evenly (P031b: reagent_counts=
+    {0: 6}, products_needed=18 -- 6/18 isn't an integer, but gcd(18, 6)=6
+    is, giving 3 output instances per unit instead of the naive 1)."""
+    g = products_needed
+    for v in recipe.reagent_counts.values():
+        if v > 0:
+            g = math.gcd(g, v)
+    for v in recipe.reaction_counts.values():
+        if v > 0:
+            g = math.gcd(g, v)
+    return g
+
+
+def _reaction_unit_counts(recipe: RecipeResult, unit_scale: int) -> Dict[str, int]:
+    """Per-unit reaction budget: the whole-run recipe.reaction_counts divided
+    by unit_scale (_unit_scale). Shared by initial_state (output-side seed)
+    and _seed_input_states (input-side seed) so both directions start from
+    exactly the same budget — required for a forward and backward search
+    to ever meet at a matching _state_signature."""
+    return {n: c // unit_scale for n, c in recipe.reaction_counts.items() if c > 0}
+
+
 def initial_state(pf: PuzzleFile, recipe: RecipeResult) -> State:
-    """One unit copy of each output molecule, with the per-unit reaction
-    budget (the whole-run recipe.reaction_counts divided by products_needed,
-    same floor-division scheme.build_unit_recipe uses)."""
+    """products_needed // _unit_scale copies of each output molecule, with
+    the per-unit reaction budget (_reaction_unit_counts), plus one free
+    atom per unit for any recipe.waste type — needed to un-fire a reaction
+    whose only tracked product is in the output, since its wasted
+    co-product must also be present to reverse the firing (see P074/
+    animismus/vitae)."""
     products_needed = pf.products_needed()
-    reaction_unit_counts = {n: c // products_needed for n, c in recipe.reaction_counts.items() if c > 0}
-    molecules = [Molecule(atoms=list(mol.atoms), bonds=list(mol.bonds)) for mol in pf.outputs]
+    g = _unit_scale(recipe, products_needed)
+    batch = products_needed // g
+    reaction_unit_counts = _reaction_unit_counts(recipe, g)
+    molecules = [Molecule(atoms=list(mol.atoms), bonds=list(mol.bonds))
+                 for mol in pf.outputs for _ in range(batch)]
+    for atype, w in recipe.waste.items():
+        molecules.extend(Molecule(atoms=[Atom(type=atype, u=0, v=0)], bonds=[])
+                          for _ in range(w // g))
     return State(molecules, reaction_unit_counts)
+
+
+_MAX_SEED_ALTERNATES = 200
+
+
+def _seed_input_states(pf: PuzzleFile, recipe: RecipeResult, products_needed: int,
+                        tracked_types: frozenset) -> Iterator[State]:
+    """Every candidate raw-reagent starting state for the forward search —
+    the mirror of initial_state, but built from pf.inputs/recipe.reagent_counts
+    instead of pf.outputs/reaction_counts. Yields the baseline composition
+    (matching recipe.reagent_counts exactly, one unit copy each) first, then
+    — only for recipes with a flexible calcify_X_or_Y group
+    (recipe.extra_reactions, see solve_recipe_combined) — every other valid
+    way to split that group's shared total among its alternative types, up
+    to _MAX_SEED_ALTERNATES: recipe.reagent_counts already encodes ONE such
+    split (solve_recipe_combined's own proportional rebalance), which may
+    not be the one any state in the backward graph actually realizes — same
+    reason _matches_raw_reagents' exact=False fallback exists, just applied
+    on the input side instead of the output side. Every yielded molecule of
+    a tracked_types type is constructed already at _READY_AGE: a genuine
+    raw reagent has no readiness requirement of its own (see
+    _matches_raw_reagents), so it must present as already-matured or its
+    _state_signature could never coincide with a backward node that
+    (correctly) treats it as ready. Uses _unit_scale, not products_needed
+    directly, as the divisor throughout — see initial_state's docstring
+    for why (P031b: reagent_counts doesn't split evenly by products_needed
+    alone)."""
+    g = _unit_scale(recipe, products_needed)
+    reaction_unit_counts = _reaction_unit_counts(recipe, g)
+
+    def make_state(counts: Dict[int, int]) -> State:
+        molecules = []
+        for i, count in counts.items():
+            if count <= 0:
+                continue
+            src = pf.inputs[i]
+            for _ in range(count // g):
+                atoms = list(src.atoms)
+                if len(atoms) == 1 and atoms[0].type in tracked_types:
+                    atoms = [replace(atoms[0], age=_READY_AGE)]
+                molecules.append(Molecule(atoms=atoms, bonds=list(src.bonds)))
+        return State(molecules, dict(reaction_unit_counts))
+
+    yield make_state(recipe.reagent_counts)
+
+    yielded = 1
+    for name, r in recipe.extra_reactions.items():
+        if yielded >= _MAX_SEED_ALTERNATES or not r.alt_reagent:
+            continue
+        types = r.alt_reagent
+        member_indices = [
+            i for i, mol in enumerate(pf.inputs)
+            if i in recipe.reagent_counts
+            and len(mol.atom_type_counts()) == 1
+            and next(iter(mol.atom_type_counts())) in types
+        ]
+        if len(member_indices) < 2:
+            continue
+
+        # The group's shared, genuinely-flexible total (per unit) — the
+        # rest of each member's current reagent_counts is fixed direct-use
+        # (bonded into the output as-is, never calcified) and must stay put.
+        # direct_use[i] = recipe.reagent_counts[i] minus whatever share of
+        # `total` solve_recipe_combined's own proportional split assigned it
+        # — reconstructed from the same repeats-weighted apportionment it
+        # uses, so this stays in sync without importing its internals.
+        total = recipe.reaction_counts.get(name, 0) // g
+        repeats = {i: recipe.reagent_group_size.get(i, 1) for i in member_indices}
+        total_repeats = sum(repeats.values()) or 1
+        base_guess = {i: (total * repeats[i]) // total_repeats for i in member_indices}
+        remainder = total - sum(base_guess.values())
+        by_remainder = sorted(member_indices, key=lambda i: (total * repeats[i]) % total_repeats, reverse=True)
+        for i in by_remainder[:max(remainder, 0)]:
+            base_guess[i] += 1
+        direct_use = {i: recipe.reagent_counts[i] - base_guess[i] for i in member_indices}
+
+        def compositions(total, n):
+            if n == 1:
+                yield (total,)
+                return
+            for first in range(total + 1):
+                for rest in compositions(total - first, n - 1):
+                    yield (first,) + rest
+
+        for split in compositions(total, len(member_indices)):
+            if yielded >= _MAX_SEED_ALTERNATES:
+                break
+            counts = dict(recipe.reagent_counts)
+            for i, s in zip(member_indices, split):
+                counts[i] = direct_use[i] + s
+            if counts == recipe.reagent_counts:
+                continue  # already yielded as the baseline
+            yield make_state(counts)
+            yielded += 1
 
 
 # ── molecule graph helpers ───────────────────────────────────────────────
@@ -1496,12 +1625,263 @@ def neighbors(state: State, reactions: Dict[str, Reaction], parts_available: int
             + _combine_with_wait(state, other, tracked_types))
 
 
+# ── forward search (meet-in-the-middle fallback) ─────────────────────────
+#
+# Everything below builds a small FORWARD (real-chronological) search from
+# the puzzle's actual raw reagents, used only as a fallback when the
+# backward search above finds no state matching them (see
+# _forward_fallback and reachable_states). "react" is the mirror of
+# un-react (_reverse_reaction_options, _choose_instances, _firing_atoms_ok,
+# _is_space_limited/_has_distinct_free_hexes/_occupied_positions, and
+# _apply_mixed_actions are all direction-agnostic and reused unchanged —
+# none of them reference "product" vs. "reagent" by name, only "atoms this
+# firing touches"). "debond" is a *new* action, not a reuse of
+# _elementary_bond_actions: that backward machinery models undoing
+# whichever *bonding* glyph (Bonder/Bonder-Prisma/Multi-bonder) built a
+# structure, each at its own construction granularity (one triplex color
+# per Bonder-Prisma pass, 2-3 bonds per Multi-bonder firing) — correct for
+# that purpose, verified against omsim/sim.c, and left untouched. Forward
+# debonding models the real Unbonder glyph (PART_UNBONDER) tearing apart
+# the raw reagent's already-given bonds instead: one Unbonder action
+# clears an entire bond — normal *and* every triplex color set on it —
+# simultaneously (sim.c's UNBONDING case: `bond_direction(...)` spans
+# NORMAL_BONDS and all three TRIPLEX_*_BONDS masks for one direction,
+# cleared together via one `&= ~ab`), and there is no multi-junction
+# equivalent for un-bonding at all (MULTI_BONDING is forward-only, bond
+# creation, in sim.c).
+
+def _elementary_forward_reaction_actions(state: State, reactions: Dict[str, Reaction],
+                                          name: str) -> List[ReactionAction]:
+    """Every single forward k=1 firing of `name` currently available and
+    legal — the mirror of _elementary_actions_for_name: consumes the
+    reagent side (`_reverse_reaction_options`'s "add_type_options", tried
+    as separate candidate alternatives for a combined calcify_X_or_Y
+    reaction) and produces the product side (its "remove_types", becoming
+    the fired ReactionAction's own add_types — the same field
+    _apply_mixed_actions already relabels/spawns from, regardless of which
+    direction populated it)."""
+    actions = []
+    r = reactions[name]
+    produce_types, consume_type_options = _reverse_reaction_options(r)
+    for consume_types in consume_type_options:
+        display_name = f"calcify_{ATOM_NAMES[consume_types[0]]}" if r.alt_reagent else name
+        for chosen in _choose_instances(state, consume_types):
+            if not _firing_atoms_ok(state, name, chosen):
+                continue
+            actions.append(ReactionAction(display_name, frozenset(chosen), name, chosen, produce_types))
+    return actions
+
+
+_MOVE_DEBOND = "debond"
+
+
+def _elementary_debond_actions(state: State, parts_available: int) -> List[BondAction]:
+    """Every individual Unbonder firing currently available: one whole-bond
+    removal — normal type and every triplex color currently set on it,
+    cleared together (see this section's own docstring for why, verified
+    against sim.c) — per bond. Gated solely on PART_UNBONDER, unlike the
+    backward un-bond moves' PART_BONDER / PART_BONDER_PRISMA /
+    PART_BONDER_SPEED gating (which key off which *bonding* glyph would
+    have built the structure, not the Unbonder)."""
+    if not (parts_available & PART_UNBONDER):
+        return []
+    actions = []
+    for mi, mol in enumerate(state.molecules):
+        pos_to_index = {(a.u, a.v): i for i, a in enumerate(mol.atoms)}
+        for bi, b in enumerate(mol.bonds):
+            ai = pos_to_index.get((b.from_u, b.from_v))
+            aj = pos_to_index.get((b.to_u, b.to_v))
+            if ai is None or aj is None:
+                continue
+            touched = frozenset({(mi, ai), (mi, aj)})
+            actions.append(BondAction(_MOVE_DEBOND, touched, {mi: {(bi, b.type)}}))
+    return actions
+
+
+def _combined_forward_neighbors(state: State, reactions: Dict[str, Reaction],
+                                 parts_available: int) -> List[Tuple[State, str]]:
+    """Every atom-disjoint combo of debond actions and forward reaction
+    firings — a single action is just the size-1 case of this, not a
+    separate path (mirrors _combined_bond_reaction_neighbors' role on the
+    backward side). Plain exact combinations() scan, no rotation-orbit
+    pooling: forward's seed-derived states are small (no known puzzle
+    hands the forward search a large symmetric raw-reagent molecule that
+    would make 2^n prohibitive here), so the pooling optimization
+    per-state combinatorics needs backward isn't needed here.
+
+    Combining matters for more than just move count: a puzzle can need a
+    debond and a reaction to fire *simultaneously* so that the atom the
+    debond frees is immediately available (already aged/positioned) for
+    the very next simultaneous debond+react pair, not one full extra step
+    later. Confirmed on P024's true-optimal path — debond,
+    debond+duplicate_air, debond+duplicate_earth, drop (L_spine 4) — which
+    an uncombined one-action-at-a-time search can never produce; it always
+    finds the longer debond, debond, debond, duplicate_air+duplicate_earth,
+    drop (L_spine 5) instead, a real (if small) latency-bound overshoot."""
+    debond_actions = _elementary_debond_actions(state, parts_available)
+    react_actions: List[ReactionAction] = []
+    for name, budget in state.reactions_left.items():
+        if budget <= 0:
+            continue
+        react_actions.extend(_elementary_forward_reaction_actions(state, reactions, name))
+
+    individual_actions: List[Action] = debond_actions + react_actions
+    n = len(individual_actions)
+
+    neighbors_out = []
+    for size in range(1, n + 1):
+        for combo in combinations(range(n), size):
+            touched_union = set()
+            disjoint = True
+            for idx in combo:
+                touched = individual_actions[idx].touched
+                if touched & touched_union:
+                    disjoint = False
+                    break
+                touched_union |= touched
+            if not disjoint:
+                continue
+            chosen = [individual_actions[idx] for idx in combo]
+
+            name_counts = Counter(a.name for a in chosen if isinstance(a, ReactionAction))
+            if any(count > state.reactions_left.get(name, 0) for name, count in name_counts.items()):
+                continue
+
+            # Space-limited anchors are checked per molecule (own connected
+            # component), never against the whole state — see
+            # _elementary_forward_reaction_actions' caller docstring history
+            # / reachable_states' P022 note — grouped by molecule since two
+            # simultaneous anchors in the *same* molecule still need
+            # distinct hexes (_has_distinct_free_hexes), but anchors in
+            # different molecules never compete for each other's hexes.
+            space_anchors_by_mol: Dict[int, List[Tuple[int, int]]] = {}
+            for a in chosen:
+                if isinstance(a, ReactionAction) and _is_space_limited(a.name):
+                    mi, ai = a.firing[0]
+                    pos = (state.molecules[mi].atoms[ai].u, state.molecules[mi].atoms[ai].v)
+                    space_anchors_by_mol.setdefault(mi, []).append(pos)
+            if space_anchors_by_mol:
+                blocked = False
+                for mi, anchors in space_anchors_by_mol.items():
+                    occupied = {(atom.u, atom.v) for atom in state.molecules[mi].atoms}
+                    if not _has_distinct_free_hexes(anchors, occupied):
+                        blocked = True
+                        break
+                if blocked:
+                    continue
+
+            labels = [a.label for a in chosen]
+            move = f"{len(chosen)}x{labels[0]}" if all(l == labels[0] for l in labels) else "+".join(labels)
+            neighbors_out.append((_apply_mixed_actions(state, chosen), move))
+    return neighbors_out
+
+
+def _forward_neighbors(state: State, reactions: Dict[str, Reaction], parts_available: int,
+                        tracked_types: frozenset) -> List[Tuple[State, str]]:
+    """Every (successor state, move label) pair reachable from `state`
+    (input-side, real-chronological) by any atom-disjoint combo of debond
+    actions and forward reaction firings (_combined_forward_neighbors,
+    including the single-action case), one "wait" alone, or any of those
+    combined with a simultaneous wait (_combine_with_wait — same fix as
+    the backward direction, applies equally forward)."""
+    other = _combined_forward_neighbors(state, reactions, parts_available)
+    return (other
+            + _wait_neighbors(state, tracked_types)
+            + _combine_with_wait(state, other, tracked_types))
+
+
+_FORWARD_FALLBACK_STATE_CAP = 3000
+
+
+def _forward_fallback(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph,
+                       reactions: Dict[str, Reaction], parts_available: int,
+                       tracked_types: frozenset, products_needed: int) -> bool:
+    """Only called when the backward-only match search (reachable_states)
+    found no state matching the raw reagents. Tries each _seed_input_states
+    candidate in turn: a local forward BFS (react/debond/wait, via
+    _forward_neighbors) from that seed, stopping expansion at any state
+    whose *molecule content* (mol_sigs — the first half of
+    _state_signature, ignoring reactions_left) already exists in `graph` (a
+    "boundary" — the fuller backward neighbors() already computed that
+    node's edges exhaustively and correctly, so it's never re-derived here)
+    and capped at _FORWARD_FALLBACK_STATE_CAP locally-discovered states.
+
+    Boundary matching deliberately ignores reactions_left: forward and
+    backward each track it against their own full per-unit budget, in
+    opposite consumption directions, so a real meeting point's two halves
+    almost never agree on it even when the molecule content is identical
+    (confirmed via a hand-traced P022 meeting point — post-debond,
+    post-react forward state vs. the topologically identical backward
+    state reached by pure un-bond: same atoms/bonds, reactions_left 0 vs.
+    1). This is sound here specifically because any reaction a forward
+    candidate already fired is one whose backward un-firing was, by
+    construction, blocked at every node on this fallback's search path
+    (that's the entire reason reachable_states' plain backward search
+    failed and this fallback is running at all) — so the matched backward
+    node's own nominally "unspent" budget for that reaction is dead weight
+    it can never actually use going further backward, not a real
+    double-spend risk. A candidate that never reaches a boundary fails
+    outright — nothing from it is written into `graph`, only a confirmed
+    connection is committed. Returns True (with
+    graph.input_state_indices/input_state_idx set from every successful
+    candidate's seed) if at least one candidate connects, False if every
+    candidate fails."""
+    boundary_index: Dict[tuple, List[int]] = {}
+    for idx, s in enumerate(graph.states):
+        boundary_index.setdefault(_state_signature(s, tracked_types)[0], []).append(idx)
+
+    successful_seed_indices = []
+    for seed in _seed_input_states(pf, recipe, products_needed, tracked_types):
+        seed_key = _state_signature(seed, tracked_types)
+        local_states: Dict[tuple, State] = {seed_key: seed}
+        local_edges: List[Tuple[tuple, tuple, str]] = []
+        boundary_edges: List[Tuple[tuple, int, str]] = []  # (from_key, backward graph idx, move)
+        queue = deque([seed])
+        while queue:
+            if len(local_states) > _FORWARD_FALLBACK_STATE_CAP:
+                break
+            current = queue.popleft()
+            current_key = _state_signature(current, tracked_types)
+            for nxt, move in _forward_neighbors(current, reactions, parts_available, tracked_types):
+                nxt_key = _state_signature(nxt, tracked_types)
+                gidxs = boundary_index.get(nxt_key[0])
+                if gidxs:
+                    for gidx in gidxs:
+                        boundary_edges.append((current_key, gidx, move))
+                    continue  # nxt IS an existing backward node — don't re-add/re-expand it
+                local_edges.append((current_key, nxt_key, move))
+                if nxt_key not in local_states:
+                    local_states[nxt_key] = nxt
+                    queue.append(nxt)
+        if not boundary_edges:
+            continue  # this candidate never reached the backward graph — try the next one
+
+        key_to_idx: Dict[tuple, int] = {}
+        for key, state in local_states.items():
+            key_to_idx[key] = graph._index[key] if key in graph._index else graph.add_state(state, key)
+        for from_key, to_key, move in local_edges:
+            # forward walk's edges point input-side -> output-side; the
+            # graph's convention is output-side -> input-side (see
+            # StateGraph docstring / reachable_states), so flip.
+            graph.add_edge(key_to_idx[to_key], key_to_idx[from_key], move)
+        for from_key, gidx, move in boundary_edges:
+            graph.add_edge(gidx, key_to_idx[from_key], move)
+        successful_seed_indices.append(key_to_idx[seed_key])
+
+    if not successful_seed_indices:
+        return False
+    graph.input_state_indices = successful_seed_indices
+    graph.input_state_idx = successful_seed_indices[0]
+    return True
+
+
 # ── BFS ────────────────────────────────────────────────────────────────────
 
 def _matches_raw_reagents(state: State, pf: PuzzleFile, recipe: RecipeResult, products_needed: int,
                            exact: bool = False) -> bool:
     """True if `state` is exactly the puzzle's raw reagents, one unit copy
-    each (per recipe.reagent_counts // products_needed). For a reagent
+    each (per recipe.reagent_counts // _unit_scale — not products_needed
+    directly, see initial_state's docstring for why). For a reagent
     covered by a combined reaction group (recipe.extra_reactions, see
     solve_recipe_combined), exact=False (the default) accepts ANY split of
     single-atom molecules among the group's alternative types as long as
@@ -1514,6 +1894,7 @@ def _matches_raw_reagents(state: State, pf: PuzzleFile, recipe: RecipeResult, pr
     and only falls back to this looser exact=False match if no state does.
     A linear scan rather than a signature dict-lookup — reachable_states
     only needs this once, over however many states the BFS found."""
+    g = _unit_scale(recipe, products_needed)
     combined_types = {t for r in recipe.extra_reactions.values() for t in (r.alt_reagent or [])}
 
     def is_combined_atom(mol):
@@ -1525,11 +1906,11 @@ def _matches_raw_reagents(state: State, pf: PuzzleFile, recipe: RecipeResult, pr
         mol = pf.inputs[i]
         if is_combined_atom(mol) and not exact:
             continue  # covered by combined_total instead of an exact per-reagent count
-        expected[molecule_signature(mol)] += count // products_needed
+        expected[molecule_signature(mol)] += count // g
 
     combined_total = None
     if not exact:
-        combined_total = sum(count // products_needed for i, count in recipe.reagent_counts.items()
+        combined_total = sum(count // g for i, count in recipe.reagent_counts.items()
                               if is_combined_atom(pf.inputs[i]))
 
     remaining = Counter(expected)
@@ -1585,11 +1966,15 @@ def reachable_states(pf: PuzzleFile, recipe: RecipeResult) -> StateGraph:
     if not match_indices:
         match_indices = [i for i, s in enumerate(graph.states)
                           if _matches_raw_reagents(s, pf, recipe, products_needed)]
-    assert match_indices, (
-        f"{pf.name!r}: no reachable state matches the actual raw reagents — "
-        "the un-react/unbond move rules failed to find a valid full "
-        "decomposition path that solve_recipe already proved exists"
-    )
-    graph.input_state_indices = match_indices
-    graph.input_state_idx = match_indices[0]
+    if match_indices:
+        graph.input_state_indices = match_indices
+        graph.input_state_idx = match_indices[0]
+    else:
+        merged = _forward_fallback(pf, recipe, graph, reactions, pf.parts_available,
+                                    tracked_types, products_needed)
+        assert merged, (
+            f"{pf.name!r}: no reachable state matches the actual raw reagents — "
+            "the un-react/unbond move rules failed to find a valid full "
+            "decomposition path that solve_recipe already proved exists"
+        )
     return graph

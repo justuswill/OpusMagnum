@@ -11,6 +11,7 @@ import itertools
 import math
 import re
 from collections import Counter, deque
+from fractions import Fraction
 from typing import Optional
 from weakref import WeakKeyDictionary
 
@@ -137,9 +138,18 @@ def _path_l_spine(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph,
     if not combined:
         return 0, "no reagents consumed along path"
 
+    # Waves needed per reagent type = instances actually pooled for it
+    # (combined[sig], summed over all len(paths) assigned copies) divided
+    # by how many duplicate glyphs handle it at once — counted directly
+    # from the real pool rather than re-derived from reagent_counts[i]/
+    # products_needed, which silently breaks whenever that ratio doesn't
+    # reduce to a whole per-path count (P031b: 6 over 18 products, i.e. 1
+    # raw cluster shared by 3 products per unit). Identical to the old
+    # formula whenever it was already correct, since combined[sig] is then
+    # exactly (instances one path contributes) * len(paths).
     num_blocks = max(
-        math.ceil((recipe.reagent_counts[i] // (pf.products_needed() / len(paths))) / recipe.reagent_group_size.get(i, 1))
-        for i in reagent_sig.values()
+        math.ceil(len(combined.get(sig, [])) / recipe.reagent_group_size.get(i, 1))
+        for sig, i in reagent_sig.items()
     )
 
     def value_order(pairs):
@@ -339,6 +349,146 @@ def _pareto_paths_raw_ls(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph
     return results
 
 
+def _output_sig(pf: PuzzleFile) -> dict:
+    return {molecule_signature(mol): i for i, mol in enumerate(pf.outputs)}
+
+
+def _pareto_paths_output_ls(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph) -> list:
+    """Mirror of _pareto_paths_raw_ls, walking forward-chronologically
+    (input -> output, via graph.edges' reverse adjacency) instead of
+    output -> input: tracks the step at which each output-type instance
+    first *appears* (becomes free-standing) rather than when a raw
+    reagent gets consumed. Feeds _input_latency, the output_constrained
+    mirror of _cadence_latency."""
+    output_sig = _output_sig(pf)
+    starts, goal = graph.input_state_indices, 0
+
+    counts_cache = {}
+
+    def type_counts(node):
+        c = counts_cache.get(node)
+        if c is None:
+            c = Counter()
+            for mol in graph.states[node].molecules:
+                sig = molecule_signature(mol)
+                if sig in output_sig:
+                    c[sig] += 1
+            counts_cache[node] = c
+        return c
+
+    in_degree = {i: 0 for i in range(len(graph.states))}
+    for a, bs in graph.edges.items():
+        for b in bs:
+            in_degree[b] += 1
+
+    order = []
+    remaining = dict(in_degree)
+    queue = deque(i for i in range(len(graph.states)) if remaining[i] == 0)
+    while queue:
+        node = queue.popleft()
+        order.append(node)
+        for nxt in graph.edges.get(node, []):
+            remaining[nxt] -= 1
+            if remaining[nxt] == 0:
+                queue.append(nxt)
+
+    rev_edges = {i: [] for i in range(len(graph.states))}
+    for a, bs in graph.edges.items():
+        for b in bs:
+            rev_edges[b].append(a)
+
+    def dominates(a, j_a, b, j_b):
+        if j_a > j_b:
+            return False
+        for sig in set(a) | set(b):
+            xs, ys = sorted(a.get(sig, [])), sorted(b.get(sig, []))
+            if len(xs) != len(ys) or not all(x <= y for x, y in zip(xs, ys)):
+                return False
+        return True
+
+    profiles = {s: [({}, [s], 0)] for s in starts}
+    for node in reversed(order):
+        entries = profiles.get(node)
+        if not entries:
+            continue
+        cur_counts = type_counts(node)
+        for nxt in rev_edges.get(node, []):
+            appeared = type_counts(nxt) - cur_counts
+            bucket = profiles.setdefault(nxt, [])
+            for profile, path, j in entries:
+                appear_val = j + 1
+                new_profile = {sig: list(vals) for sig, vals in profile.items()}
+                for sig, cnt in appeared.items():
+                    if cnt > 0:
+                        new_profile.setdefault(sig, []).extend([appear_val] * cnt)
+                new_path = path + [nxt]
+                new_j = j + 1
+
+                dominated = False
+                survivors = []
+                for other_profile, other_path, other_j in bucket:
+                    if dominated or dominates(other_profile, other_j, new_profile, new_j):
+                        dominated = True
+                        survivors.append((other_profile, other_path, other_j))
+                    elif not dominates(new_profile, new_j, other_profile, other_j):
+                        survivors.append((other_profile, other_path, other_j))
+                if not dominated:
+                    survivors.append((new_profile, new_path, new_j))
+                bucket[:] = survivors
+
+    results = []
+    for profile, path, _j in profiles.get(goal, []):
+        results.append((path, profile))
+    return results
+
+
+def _input_latency(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph) -> tuple[int, str]:
+    """output_constrained mirror of _cadence_latency: instead of asking
+    when raw reagents get consumed (limited by input availability), asks
+    when each output-type instance first appears (limited by how fast the
+    build-up produces outputs), walking forward from the raw reagents.
+
+    Per Pareto path (_pareto_paths_output_ls), each output type's pooled
+    appear-steps are sorted ascending and adjusted by subtracting their
+    rank (0, 1, 2, ...) — the same single-resource release-time
+    reasoning _path_l_spine uses, just simplified (no repeats/wave
+    grouping): the i-th (0-indexed) instance to appear can be fully
+    absorbed by whatever consumes it i cycles later than the first
+    without adding delay, so only the max adjusted value is a genuine
+    bottleneck. L_spine for a path is the max of that over every output
+    type; the puzzle's L_spine is the smallest across all Pareto paths,
+    ties broken by lexicographically-smallest path."""
+    output_sig = _output_sig(pf)
+    pareto = _pareto_paths_output_ls(pf, recipe, graph)
+
+    def path_l_spine(profile):
+        """(L_spine, blamed sig) for one path — blamed is whichever output
+        type's own adjusted max drove the path's L_spine, mirroring
+        _path_l_spine's `i` tracking."""
+        if not profile:
+            return 0, None
+        best = None
+        for sig, values in profile.items():
+            adjusted_max = max(v - idx for idx, v in enumerate(sorted(values)))
+            if best is None or adjusted_max > best[0]:
+                best = (adjusted_max, sig)
+        return best
+
+    scored = sorted(
+        ((*path_l_spine(profile), path) for path, profile in pareto),
+        key=lambda r: (r[0], r[2]),
+    )
+    L_spine, blamed_sig, path = scored[0]
+
+    D = len(path) - 1
+    moves = [graph.edge_move[(path[k], path[k - 1])] for k in range(1, D + 1)]
+    blocking_moves = moves[:L_spine]
+    steps = " + ".join(["grab=1"] + [f"{mv}=1" for mv in blocking_moves])
+    blamed = describe_molecule(pf.outputs[output_sig[blamed_sig]]) if blamed_sig is not None else "output"
+    note = f"{blamed}: {steps}"
+    return L_spine + 1, note
+
+
 def _cadence_latency(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph) -> tuple[int, str]:
     """L_spine across every structurally-distinct path from raw reagents to
     the output (schematic.py's _all_paths_nodes, forward-chronological
@@ -374,8 +524,8 @@ def _cadence_latency(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph) ->
         if count <= 0:
             continue
         repeats = recipe.reagent_group_size.get(i, 1)
-        unit_count = count // products_needed
-        period = math.lcm(period, repeats // math.gcd(unit_count, repeats))
+        unit_count = Fraction(count, products_needed)
+        period = math.lcm(period, unit_count.denominator * (repeats // math.gcd(unit_count.numerator, repeats)))
 
     # paths = _all_paths_nodes(graph, graph.input_state_idx, 0)
     # raw_ls_by_path = {id(path): _path_raw_ls(pf, recipe, graph, path) for path in paths}
@@ -444,8 +594,11 @@ def cycles_lower_bound_single(pf: PuzzleFile, recipe: RecipeResult, states: Stat
     """
     products_needed = pf.products_needed()
 
-    N = products_needed
-    note = f"output throughput: {products_needed} products, 1/cycle"
+    N_out = products_needed
+    note_out = f"output throughput: {products_needed} products, 1/cycle"
+
+    N_in = 0
+    note_in = ""
 
     combined_reagent_indices = set()
     for r in recipe.extra_reactions.values():
@@ -463,14 +616,14 @@ def cycles_lower_bound_single(pf: PuzzleFile, recipe: RecipeResult, states: Stat
         if total_count <= 0:
             continue
         cycles = 2 * math.ceil(total_count / total_repeats)
-        if cycles > N:
-            N = cycles
+        if cycles > N_in:
+            N_in = cycles
             breakdown = " + ".join(
                 f"{recipe.reagent_group_size.get(i, 1)}x{ATOM_NAMES[next(iter(pf.inputs[i].atom_type_counts()))]}"
                 for i in member_indices
             )
-            note = (f"input throughput {N}: {total_count}x needed from combined "
-                    f"{total_repeats} duplicates ({breakdown})")
+            note_in = (f"input throughput {N_in}: {total_count}x needed from combined "
+                       f"{total_repeats} duplicates ({breakdown})")
 
     for i, count in recipe.reagent_counts.items():
         if i in combined_reagent_indices:
@@ -479,20 +632,30 @@ def cycles_lower_bound_single(pf: PuzzleFile, recipe: RecipeResult, states: Stat
             continue
         repeats = recipe.reagent_group_size.get(i, 1)
         cycles = 2 * math.ceil(count / repeats)
-        if cycles > N:
-            N = cycles
-            note = (f"input throughput {N}: {count}x needed from input {i}"
-                    + (f" with {repeats} duplicates" if repeats > 1 else ""))
+        if cycles > N_in:
+            N_in = cycles
+            note_in = (f"input throughput {N_in}: {count}x needed from input {i}"
+                       + (f" with {repeats} duplicates" if repeats > 1 else ""))
 
-    L, spine_note = _cadence_latency(pf, recipe, states)
-    latency_parts = [spine_note]
     all_repeating = all(any(a.type == ATOM_REPEAT for a in mol.atoms) for mol in pf.outputs)
+    drop_term = 0 if all_repeating else 1
+    L_out, spine_note_out = _input_latency(pf, recipe, states)  # already includes its own grab=1/+1
+    L_in, spine_note_in = _cadence_latency(pf, recipe, states)
+    total_out = N_out + L_out + drop_term
+    total_in = N_in + L_in + drop_term
+    output_constrained = total_out >= total_in
+
+    if output_constrained:
+        total, note, L, latency_parts = total_out, note_out, L_out, [spine_note_out]
+    else:
+        total, note, L, latency_parts = total_in, note_in, L_in, [spine_note_in]
     if not all_repeating:
         latency_parts.append("drop=1")  # last drop isn't pipelined away unless every output repeats
         L += 1
-    latency_note = f"input latency {L}: " + " + ".join(latency_parts)
+    label = "output latency" if output_constrained else "input latency"
+    latency_note = f"{label} {L}: " + " + ".join(latency_parts)
 
-    return N + L, f"{note}, {latency_note}"
+    return total, f"{note}, {latency_note}"
 
 
 def cycles_lower_bound(pf: PuzzleFile, recipe: RecipeResult, states: StateGraph,
