@@ -171,18 +171,18 @@ def main(args):
         recipe = recipe_cheap = solve_recipe(pf)
     print_recipe(pf, recipe)
     print()
-    states = reachable_states(pf, recipe, workers=args.workers, batch_size=args.batch_size)
-    # print(states)
-    # print()
 
     # ── Analytic lower bounds ─────────────────────────────────────────────
 
     g_lo, g_note = cost_lower_bound(pf, recipe_cheap)
-    c_lo, c_note = cycles_lower_bound(pf, recipe, states, workers=args.workers, batch_size=args.batch_size)
     if not is_prod:
         t_lo, t_note = area_lower_bound(pf, recipe_cheap)
     else:
         t_lo, t_note = 1, "trivial (≥1 instruction)"
+    states = reachable_states(pf, recipe, workers=args.workers, batch_size=args.batch_size)
+    # print(states)
+    # print()
+    c_lo, c_note = cycles_lower_bound(pf, recipe, states, workers=args.workers, batch_size=args.batch_size)
 
     # ── Lower bounds + individual records table ───────────────────────────
 
@@ -279,7 +279,7 @@ def _chapter_1_2_pids():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compute proven bounds for the optimal SUM solution.")
-    parser.add_argument("--puzzle", default='P031b', metavar="ID",
+    parser.add_argument("--puzzle", default='P022', metavar="ID",
                          help="Puzzle ID (default: run every chapter 1+2 puzzle, P007-P022)")
     parser.add_argument("--workers", type=int, default=None,
                          help="Worker process count for the state-space search "
