@@ -3,13 +3,11 @@ bounds.py — analytic lower bounds on the metrics of an optimal solution.
 
 These are provable floors (cost, cycles, area, instructions) derived from the
 puzzle's inputs/outputs/available parts alone — no search, no simulation.
-See PLAN.md §7.4/§7.5: a metric is *proven optimal* when one of these bounds
-equals the best known record.
+A metric is *proven optimal* when one of these bounds equals the best known record.
 """
 
 import itertools
 import math
-import re
 from collections import Counter, deque
 from fractions import Fraction
 from typing import Optional
@@ -31,6 +29,9 @@ from schematic import StateGraph, molecule_signature, _is_drop_and_create, _HEX_
 from schematic_parallel import reachable_states
 
 _cadence_latency_memo: "WeakKeyDictionary[StateGraph, tuple]" = WeakKeyDictionary()
+
+
+# ── Cycle bounds via optimal path through StateGraph ──────────────────
 
 
 def _all_paths_nodes(graph: StateGraph, start: int, goal: int) -> list:
@@ -544,149 +545,6 @@ def _cadence_latency(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph) ->
     return best
 
 
-def _bond_signatures_by_type(mols) -> dict:
-    """atom_type -> list of 6-slot direction lists, one per instance of
-    that type across `mols` — slot i is None if unbonded in _HEX_DIRS[i]'s
-    direction, else (bond_type, neighbor_atom_type). Geometry-aware (one
-    slot per real hex direction, not a deduped set) so a hex fully
-    surrounded by six identically-typed neighbors — e.g. a water bonded
-    to six salts — still reads as six distinct bonds instead of
-    collapsing to one; comparing two such lists needs a rotation search
-    (see _bond_signature_compatible), since the same molecule can appear
-    at any of the 6 rotations in the hex grid."""
-    result: dict = {}
-    for mol in mols:
-        pos_to_type = {(a.u, a.v): a.type for a in mol.atoms}
-        slots = {(a.u, a.v): [None] * len(_HEX_DIRS) for a in mol.atoms}
-        for b in mol.bonds:
-            fpos, tpos = (b.from_u, b.from_v), (b.to_u, b.to_v)
-            ftype, ttype = pos_to_type.get(fpos), pos_to_type.get(tpos)
-            if ftype is None or ttype is None:
-                continue
-            fdir = (tpos[0] - fpos[0], tpos[1] - fpos[1])
-            tdir = (fpos[0] - tpos[0], fpos[1] - tpos[1])
-            if fdir in _HEX_DIRS:
-                slots[fpos][_HEX_DIRS.index(fdir)] = (b.type, ttype)
-            if tdir in _HEX_DIRS:
-                slots[tpos][_HEX_DIRS.index(tdir)] = (b.type, ftype)
-        for pos, atype in pos_to_type.items():
-            result.setdefault(atype, []).append(slots[pos])
-    return result
-
-
-def _reachable_via_transform(earlier: int, later: int, needs_calc: bool, needs_dup: bool,
-                              has_rejection: bool, has_projection: bool, has_space: bool) -> bool:
-    """True if a bonded neighbor of type `earlier` could still be sitting
-    in that same bonded spot, now showing as `later`, because a
-    single-atom transform reaction turned it there in place without ever
-    touching the bond — calcification (elemental -> salt), duplication
-    (salt -> elemental), rejection (higher metal -> lower), or
-    projection/purification (lower metal -> higher). Direction matters:
-    `earlier` is whichever side of the comparison is chronologically
-    first (see reference_is_earlier in _bond_signature_compatible).
-    Duplication/rejection/projection additionally require `has_space` —
-    at least one open (None) slot in one of the two full signatures being
-    compared — since those glyphs need the atom to still have a free hex
-    to be walked to/from by an arm; calcification has no such requirement."""
-    if earlier == later:
-        return True
-    if needs_calc and earlier in ELEMENTALS and later == ATOM_SALT:
-        return True
-    if not has_space:
-        return False
-    if needs_dup and earlier == ATOM_SALT and later in ELEMENTALS:
-        return True
-    if earlier in METAL_CHAIN and later in METAL_CHAIN:
-        ei, li = METAL_CHAIN.index(earlier), METAL_CHAIN.index(later)
-        if has_rejection and li <= ei:
-            return True
-        if has_projection and li >= ei:
-            return True
-    return False
-
-
-def _transform_source_types(atype: int, out_sig: list, needs_calc: bool, needs_dup: bool,
-                             has_rejection: bool, has_projection: bool,
-                             require_space: bool = True) -> set:
-    """Types a bonded input atom could have been before a single-atom
-    transform reaction turned it into `atype` in place, without ever
-    touching its bonds — the reverse of _reachable_via_transform. Always
-    includes `atype` itself. Duplication/rejection/projection are gated by
-    `out_sig` having at least one open (None) slot, matching has_space in
-    _reachable_via_transform/_bond_signature_compatible (calcification has
-    no such requirement); the in_sig side of has_space is still checked
-    precisely once a specific candidate signature is in hand. Pass
-    require_space=False to skip this out_sig-level gate entirely and rely
-    solely on that per-in_sig check — needed when out_sig itself is the
-    thing whose own space is in question (needs_bonder: is a fully-bonded
-    *output* structure explainable by transforming an already-bonded input
-    atom in place? out_sig having no space doesn't rule out candidates the
-    way it does for needs_debond, where out_sig is merely the later side of
-    an ordinary neighbor comparison)."""
-    types = {atype}
-    if needs_calc and atype == ATOM_SALT:
-        types |= ELEMENTALS
-    if require_space and None not in out_sig:
-        return types
-    if needs_dup and atype in ELEMENTALS:
-        types.add(ATOM_SALT)
-    if atype in METAL_CHAIN:
-        li = METAL_CHAIN.index(atype)
-        if has_rejection:
-            types.update(METAL_CHAIN[li:])
-        if has_projection:
-            types.update(METAL_CHAIN[:li + 1])
-    return types
-
-
-def _bond_signature_compatible(reference: list, candidate: list,
-                                normal_only: bool = False, triplex_only: bool = False,
-                                reference_is_earlier: bool = True,
-                                needs_calc: bool = False, needs_dup: bool = False,
-                                has_rejection: bool = False, has_projection: bool = False) -> bool:
-    """True if some rotation of `reference` has every non-None slot
-    matching `candidate` at that same (rotated) slot — i.e. `reference`'s
-    bonds are all still present in `candidate`, just possibly turned to a
-    different one of the 6 hex orientations. With normal_only (or
-    triplex_only), any reference slot whose bond isn't a normal (or
-    triplex) bond is treated as a don't-care (None) — used to tell
-    whether an incompatibility is specifically about a missing bond of
-    that kind, since Bonder and Bonder-Prisma are separate glyphs.
-
-    A slot "matches" if the bond type is identical and either the
-    neighbor atom type is identical too, or a single-atom transform
-    reaction the puzzle needs could turn one neighbor type into the
-    other in place — see _reachable_via_transform. reference_is_earlier
-    says which side of the pair is chronologically first (needs_debond
-    compares raw-input-first against the final output; needs_bond/
-    needs_star_tracks compare a target shape second against what the raw
-    input already offers first, i.e. reference is the *later* side)."""
-    n = len(reference)
-    has_space = None in reference or None in candidate
-
-    def ref_slot(i):
-        s = reference[i]
-        if s is not None:
-            if normal_only and not (s[0] & BOND_NORMAL):
-                return None
-            if triplex_only and not (s[0] & BOND_ANY_TRIPLEX):
-                return None
-        return s
-
-    def slots_match(r, c):
-        if r is None:
-            return True
-        if c is None or r[0] != c[0]:
-            return False
-        earlier, later = (r[1], c[1]) if reference_is_earlier else (c[1], r[1])
-        return _reachable_via_transform(earlier, later, needs_calc, needs_dup, has_rejection, has_projection, has_space)
-
-    return any(
-        all(slots_match(ref_slot(i), candidate[(i + shift) % n]) for i in range(n))
-        for shift in range(n)
-    )
-
-
 def cycles_lower_bound_single(pf: PuzzleFile, recipe: RecipeResult, states: StateGraph) -> tuple[int, str]:
     """
     Throughput (N) + Steps (L) (+ 1) lower bound on cycle count.
@@ -809,6 +667,9 @@ def cycles_lower_bound(pf: PuzzleFile, recipe: RecipeResult, states: StateGraph,
     return c_lo, c_note
 
 
+# ── Cycle bounds at fixed costs ───────────────────────────────────────
+
+
 def _min_arm_cost(k: int, N: int) -> Optional[int]:
     """Minimum gold in arms to deliver >= k reagent grabs within N cycles,
     combining three purchasable per-stream rate tiers:
@@ -901,12 +762,186 @@ def cycles_lower_bound_for_budget(pf: PuzzleFile, recipe: RecipeResult, states: 
     return lo + L
 
 
+# ── Area/Cost bounds via rules ────────────────────────────────────────
+
+
+def _bond_signatures_by_type(mols) -> dict:
+    """atom_type -> list of 6-slot direction lists, one per instance of that type across `mols`
+    — slot i is None if unbonded in _HEX_DIRS[i]'s direction, else (bond_type, neighbor_atom_type).
+    Comparing two such lists needs a rotation search, for any of the 6 rotations in the hex grid."""
+    result: dict = {}
+    for mol in mols:
+        pos_to_type = {(a.u, a.v): a.type for a in mol.atoms}
+        slots = {(a.u, a.v): [None] * len(_HEX_DIRS) for a in mol.atoms}
+        for b in mol.bonds:
+            fpos, tpos = (b.from_u, b.from_v), (b.to_u, b.to_v)
+            ftype, ttype = pos_to_type.get(fpos), pos_to_type.get(tpos)
+            if ftype is None or ttype is None:
+                continue
+            fdir = (tpos[0] - fpos[0], tpos[1] - fpos[1])
+            tdir = (fpos[0] - tpos[0], fpos[1] - tpos[1])
+            if fdir in _HEX_DIRS:
+                slots[fpos][_HEX_DIRS.index(fdir)] = (b.type, ttype)
+            if tdir in _HEX_DIRS:
+                slots[tpos][_HEX_DIRS.index(tdir)] = (b.type, ftype)
+        for pos, atype in pos_to_type.items():
+            result.setdefault(atype, []).append(slots[pos])
+    return result
+
+
+def _reachable_via_transform(earlier: int, later: int, needs_calc: bool, needs_dup: bool,
+                              has_rejection: bool, has_projection: bool, has_space: bool) -> bool:
+    """True if a bonded neighbor of type `earlier` could still be sitting
+    in that same bonded spot, now showing as `later`, because a
+    single-atom transform reaction turned it there in place without ever touching the bond
+    — calcification (elemental -> salt), duplication (salt -> elemental),
+    rejection (higher metal -> lower), or projection (lower metal -> higher).
+    Duplication/rejection/projection additionally require `has_space` —
+    at least one open (None) slot in one of the two full signatures being
+    compared — since those glyphs need the atom to still have a free hex
+    to be walked to/from by an arm; calcification has no such requirement."""
+    if earlier == later:
+        return True
+    if needs_calc and earlier in ELEMENTALS and later == ATOM_SALT:
+        return True
+    if not has_space:
+        return False
+    if needs_dup and earlier == ATOM_SALT and later in ELEMENTALS:
+        return True
+    if earlier in METAL_CHAIN and later in METAL_CHAIN:
+        ei, li = METAL_CHAIN.index(earlier), METAL_CHAIN.index(later)
+        if has_rejection and li <= ei:
+            return True
+        if has_projection and li >= ei:
+            return True
+    return False
+
+
+def _transform_source_types(atype: int, needs_calc: bool, needs_dup: bool,
+                             has_rejection: bool, has_projection: bool) -> set:
+    """Types a bonded input atom could have been before a single-atom
+    transform reaction turned it into `atype` in place, without ever
+    touching its bonds — the reverse of _reachable_via_transform. Always
+    includes `atype` itself. Defers checking for space to later."""
+    types = {atype}
+    if needs_calc and atype == ATOM_SALT:
+        types |= ELEMENTALS
+    if needs_dup and atype in ELEMENTALS:
+        types.add(ATOM_SALT)
+    if atype in METAL_CHAIN:
+        li = METAL_CHAIN.index(atype)
+        if has_rejection:
+            types.update(METAL_CHAIN[li:])
+        if has_projection:
+            types.update(METAL_CHAIN[:li + 1])
+    return types
+
+
+def _bond_signature_compatible(reference: list, candidate: list,
+                                normal_only: bool = False, triplex_only: bool = False,
+                                reference_is_earlier: bool = True,
+                                needs_calc: bool = False, needs_dup: bool = False,
+                                has_rejection: bool = False, has_projection: bool = False) -> bool:
+    """True if some rotation of `reference` has every non-None slot
+    matching `candidate` at that same (rotated) slot — i.e. `reference`'s
+    bonds are all still present in `candidate`, just possibly turned to a
+    different one of the 6 hex orientations. With normal_only (or
+    triplex_only), any reference slot whose bond isn't a normal (or
+    triplex) bond is treated as a don't-care (None) — used to tell
+    whether an incompatibility is specifically about a missing bond of
+    that kind, since Bonder and Bonder-Prisma are separate glyphs.
+
+    A slot "matches" if the bond type is identical and either the
+    neighbor atom type is identical too, or a single-atom transform
+    reaction the puzzle needs could turn one neighbor type into the
+    other in place — see _reachable_via_transform. reference_is_earlier
+    says which side of the pair is chronologically first (needs_debond
+    compares raw-input-first against the final output; needs_bond/
+    needs_star_tracks compare a target shape second against what the raw
+    input already offers first, i.e. reference is the *later* side)."""
+    n = len(reference)
+    has_space = None in reference or None in candidate
+
+    def ref_slot(i):
+        s = reference[i]
+        if s is not None:
+            if normal_only and not (s[0] & BOND_NORMAL):
+                return None
+            if triplex_only and not (s[0] & BOND_ANY_TRIPLEX):
+                return None
+        return s
+
+    def slots_match(r, c):
+        if r is None:
+            return True
+        if c is None or r[0] != c[0]:
+            return False
+        earlier, later = (r[1], c[1]) if reference_is_earlier else (c[1], r[1])
+        return _reachable_via_transform(earlier, later, needs_calc, needs_dup, has_rejection, has_projection, has_space)
+
+    return any(
+        all(slots_match(ref_slot(i), candidate[(i + shift) % n]) for i in range(n))
+        for shift in range(n)
+    )
+
+
+def _needs_bond_action(output_bond_sigs: dict, input_bond_sigs: dict, *,
+                        reference_is_earlier: bool,
+                        normal_only: bool = False, triplex_only: bool = False,
+                        needs_calc: bool, needs_dup: bool,
+                        has_rejection: bool, has_projection: bool,
+                        synthesizable_single=None) -> bool:
+    """Shared core of needs_debond/needs_bonder/needs_bonder_prisma: for
+    every output atom's bond signature, is there a transform-reachable
+    bonded input precedent compatible with it via _bond_signature_compatible?
+    reference_is_earlier picks which side is the input side.
+    `synthesizable_single` is required to verify if single atom outputs
+    are reachable, as that case can use non-bonded transforms."""
+    def relevant(sig):
+        # Consider only molecules with relevant bonds
+        return any(
+            s is not None
+            and (not normal_only or (s[0] & BOND_NORMAL))
+            and (not triplex_only or (s[0] & BOND_ANY_TRIPLEX))
+            for s in sig
+        )
+
+    def compatible(atype, out_sig, srcs):
+        return any(
+            _bond_signature_compatible(
+                *((in_sig, out_sig) if reference_is_earlier else (out_sig, in_sig)),
+                normal_only=normal_only, triplex_only=triplex_only,
+                reference_is_earlier=reference_is_earlier,
+                needs_calc=needs_calc, needs_dup=needs_dup,
+                has_rejection=has_rejection, has_projection=has_projection,
+            )
+            for src in srcs
+            for in_sig in input_bond_sigs.get(src, ())
+            if _reachable_via_transform(src, atype, needs_calc, needs_dup, has_rejection, has_projection, None in in_sig)
+        )
+
+    return any(
+        # cant be made from bond-less inputs
+        (
+            (synthesizable_single is not None and not synthesizable_single(atype))
+            if all(s is None for s in out_sig) else
+            (
+                # cant be made by removing pre-existing bounds
+                relevant(out_sig) and any(src in input_bond_sigs for src in srcs)
+                if reference_is_earlier else
+                relevant(out_sig)
+            )
+        )
+        # and cant use pre-existing bounds
+        and not compatible(atype, out_sig, srcs)
+        for atype, out_sigs in output_bond_sigs.items()
+        for out_sig in out_sigs
+        for srcs in [_transform_source_types(atype, needs_calc, needs_dup, has_rejection, has_projection)]
+    )
+
+
 def _division_closure(m: int) -> set:
-    """All metals reachable from m via zero or more divide_ firings (each
-    firing replaces one metal with its DIVISION_OUTPUTS pair, which need not
-    be adjacent chain steps or even include m's own neighbors — e.g. gold
-    only divides to iron+iron, never silver or copper; silver only to
-    tin+iron, never copper; copper only to tin+tin, never iron)."""
+    """All metals reachable from m via zero or more divide_ firings."""
     seen = set()
     stack = [m]
     while stack:
@@ -920,19 +955,42 @@ def _division_closure(m: int) -> set:
 _DIVISION_REACHABLE = {m: _division_closure(m) for m in METAL_CHAIN}
 
 
+def _division_reachable_from(m: int, available: set, have_up_glyph: bool) -> bool:
+    """True if metal `m` is reachable via Division from something in
+    `available`, allowing the divided-from metal to first be climbed up
+    via Projection/Purification (if have_up_glyph) past its own rank —
+    mirroring the lead-bootstrap idea already used for Rejection's
+    quicksilver byproduct (see _resolve_single_quicksilver). Division's
+    own reachability (_DIVISION_REACHABLE) only covers dividing a metal
+    already at that rank; the climb is a separate, earlier step (e.g.
+    P256-Lodestone: copper purifies up to silver, then silver divides to
+    tin+iron — copper's own division alone only reaches tin/lead)."""
+    for h in available:
+        if h not in METAL_CHAIN:
+            continue
+        climbable = METAL_CHAIN[METAL_CHAIN.index(h):] if have_up_glyph else (h,)
+        if any(m in _DIVISION_REACHABLE.get(c, ()) for c in climbable):
+            return True
+    return False
+
+
+def _resolve_single_quicksilver(single_atom_input_types: set, can_reject: bool,
+                                 metal_glyph_up: Optional[str]) -> bool:
+    """True if a free (single-atom) Quicksilver is reachable."""
+    return (
+        ATOM_QUICKSILVER in single_atom_input_types
+        or (can_reject and any(m in single_atom_input_types for m in METAL_CHAIN[1:]))
+        or (can_reject and metal_glyph_up is not None and METAL_CHAIN[0] in single_atom_input_types)
+    )
+
+
 def _synthesizable_single(x: int, single_atom_input_types: set,
                            metal_glyph_up: Optional[str], metal_glyph_down: Optional[str],
                            single_salt: bool, single_quicksilver: bool, has_proliferation: bool,
                            needs_baron_duplication: bool, needs_dispersion: bool,
                            needs_animismus: bool, needs_unification: bool) -> bool:
     """True if a free single atom of type `x` is reachable directly from
-    the puzzle's single-atom raw inputs, without ever passing through a
-    bonded intermediate — metal chain climbing/rejection/division, salt via
-    calcification, elementals via duplication or dispersion, quicksilver via
-    rejection, vitae/mors via animismus, quintessence via unification or
-    duplication. Shared by _needed_parts's needs_debond (raw, possibly
-    ambiguous metal_glyph_up/down labels) and _tracks_access's unbonder
-    access (tie-break-resolved labels)."""
+    the puzzle's single-atom raw inputs, without ever passing through a bonded intermediate."""
     if x in single_atom_input_types:
         return True
     if x in METAL_CHAIN:
@@ -960,44 +1018,30 @@ def _synthesizable_single(x: int, single_atom_input_types: set,
     return False
 
 
-def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
-    """
-    Which extra parts a solution is provably forced to buy, from atom-type
-    and bond-type presence/absence between inputs and outputs, plus how
-    much Track that forces (needed["tracks"], needed["access"] — see
-    cost_lower_bound's docstring for the exact access/track rules). Shared
-    by cost_lower_bound and area_lower_bound.
-    """
-    # Collect atom types and bond types across inputs and outputs
-    input_atom_types: set[int] = set()
-    for mol in pf.inputs:
-        input_atom_types.update(a.type for a in mol.atoms)
-
-    output_atom_types: set[int] = set()
-    for mol in pf.outputs:
-        output_atom_types.update(a.type for a in mol.atoms)
-
-    needs_elemental = bool((output_atom_types & ELEMENTALS) - input_atom_types)
-    has_projection = bool(pf.parts_available & PART_PROJECTION)
-    has_purification = bool(pf.parts_available & PART_PURIFICATION)
-    has_rejection = bool(pf.parts_available & PART_REJECTION)
-    has_division = bool(pf.parts_available & PART_DIVISION)
+def _resolve_metal_chain_forcing(input_atom_types: set, output_atom_types: set,
+                                  has_projection: bool, has_purification: bool,
+                                  has_rejection: bool, has_division: bool,
+                                  has_quicksilver: bool):
+    """Which metal-chain direction(s) a solution is forced to buy, and the
+    concrete/ambiguous glyph label(s) that resolves to. Walks each metal
+    absent from input but present in output, checking whether it's
+    reachable climbing up (Projection/Purification from a lower metal
+    already in input) and/or down (Rejection from a higher metal, or
+    Division from a metal whose fixed DIVISION_OUTPUTS pair reaches it) —
+    forced up-only, forced down-only, either-direction-works, or (if
+    neither) in need of Ravari+Proliferation instead. Also folds in the
+    special case where Quicksilver itself is the missing output (only
+    Rejection produces it — and if no metal above lead is present to
+    reject, forces climbing lead up first as a bootstrap)."""
     have_up_glyph = has_projection or has_purification
-    has_quicksilver = ATOM_QUICKSILVER in input_atom_types
-    can_get_quicksilver_via_rejection = has_rejection and any(
-        m2 in input_atom_types for m2 in METAL_CHAIN[1:]
-    )
-
     force_up = force_down = force_rejection = either_ok = needs_proliferation = False
     for i, m in enumerate(METAL_CHAIN):
         if m not in output_atom_types or m in input_atom_types:
             continue
         can_up = have_up_glyph and any(lower in input_atom_types for lower in METAL_CHAIN[:i])
         can_down_rej = has_rejection and any(higher in input_atom_types for higher in METAL_CHAIN[i + 1:])
-        can_down_div = has_division and any(
-            higher in input_atom_types and m in _DIVISION_REACHABLE.get(higher, ())
-            for higher in METAL_CHAIN[i + 1:]
-        )
+        can_down_div = has_division and _division_reachable_from(m, input_atom_types, have_up_glyph)
+        can_down_div_direct = has_division and _division_reachable_from(m, input_atom_types, False)
         can_down = can_down_rej or can_down_div
         if can_up and not can_down:
             force_up = True
@@ -1005,6 +1049,8 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
             force_down = True
             if can_down_rej and not can_down_div:
                 force_rejection = True
+            if can_down_div and not can_down_div_direct and not can_down_rej:
+                force_up = True
         elif can_up and can_down:
             either_ok = True
         else:
@@ -1046,68 +1092,87 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
     else:
         metal_glyph_down = None
 
-    needs_calcification = (ATOM_SALT in output_atom_types and ATOM_SALT not in input_atom_types
-                            and bool(input_atom_types & ELEMENTALS))
+    return force_up, force_down, either_ok, needs_proliferation, metal_glyph_up, metal_glyph_down
+
+
+def _resolve_elemental_glyphs(pf: PuzzleFile, input_atom_types: set, output_atom_types: set):
+    """The non-metal single-atom transform glyphs: calcification (salt
+    from elemental), animismus (vitae/mors from salt), dispersion/
+    unification (elemental<->quintessence), and the Baron+Duplication
+    alternative to dispersion. Also returns the single-atom-input
+    reachability sets these (and the metal-chain/bond-action glyphs) rely
+    on to know whether a bonded intermediate would be needed instead of a
+    free atom."""
     needs_animismus = (
         (ATOM_VITAE in output_atom_types and ATOM_VITAE not in input_atom_types)
         or (ATOM_MORS in output_atom_types and ATOM_MORS not in input_atom_types)
     )
-    needs_dispersion = needs_elemental and not bool(pf.parts_available & PART_BARON)
     needs_unification = (ATOM_QUINTESSENCE in output_atom_types
                           and ATOM_QUINTESSENCE not in input_atom_types)
+    needs_calcification = (
+        (ATOM_SALT in output_atom_types or needs_animismus)
+        and ATOM_SALT not in input_atom_types
+    )
+    needs_elemental = (
+        bool((output_atom_types & ELEMENTALS) - input_atom_types)
+        or (needs_unification and not ELEMENTALS.issubset(input_atom_types))
+        or (needs_calcification and not bool(input_atom_types & ELEMENTALS))
+    )
+    # Dispersion is always cheaper/smaller
+    needs_dispersion = needs_elemental and ATOM_QUINTESSENCE in input_atom_types
+    if needs_calcification:
+        assert (bool(input_atom_types & ELEMENTALS) or needs_dispersion)
     single_atom_input_types = {a.type for mol in pf.inputs if len(mol.atoms) == 1 for a in mol.atoms}
     single_salt = (
         ATOM_SALT in single_atom_input_types
-        or (needs_calcification and bool(single_atom_input_types & ELEMENTALS))
+        or (needs_calcification and (bool(single_atom_input_types & ELEMENTALS) or needs_dispersion))
     )
     single_quintessence = ATOM_QUINTESSENCE in single_atom_input_types
     single_all_elementals = ELEMENTALS.issubset(single_atom_input_types)
-    needs_baron_duplication = (
-        needs_elemental
-        and ATOM_QUINTESSENCE not in input_atom_types
-        and bool(pf.parts_available & PART_BARON)
-    )
-    # bonding glyphs
-    input_bond_sigs = _bond_signatures_by_type(pf.inputs)
-    output_bond_sigs = _bond_signatures_by_type(pf.outputs)
+    needs_baron_duplication = needs_elemental and ATOM_QUINTESSENCE not in input_atom_types
+    if needs_baron_duplication:
+        assert bool(pf.parts_available & PART_BARON)
+    return (needs_calcification, needs_animismus, needs_dispersion, needs_unification,
+            needs_baron_duplication, single_atom_input_types, single_salt,
+            single_quintessence, single_all_elementals)
+
+
+def _resolve_bond_actions(pf: PuzzleFile, input_atom_types: set,
+                           input_bond_sigs: dict, output_bond_sigs: dict,
+                           have_up_glyph: bool, has_rejection: bool, has_division: bool,
+                           metal_glyph_up: Optional[str], metal_glyph_down: Optional[str],
+                           force_up: bool, force_down: bool,
+                           needs_calcification: bool, needs_baron_duplication: bool,
+                           needs_animismus: bool, needs_dispersion: bool, needs_unification: bool,
+                           single_atom_input_types: set, single_salt: bool,
+                           single_quintessence: bool, single_all_elementals: bool,
+                           has_quicksilver: bool, can_get_quicksilver_via_rejection: bool,
+                           needs_proliferation: bool):
+    """Bonder/Unbonder/Bonder-Prisma requirements: per-atom-instance,
+    geometry-aware bond-signature comparison, plus needs_unbonder's other sources
+    — animismus/dispersion/unification each needing an unbonder when their raw
+    material (salt / quintessence / all four elementals respectively) only exists bonded
+    — a free-metal-output that requires an intermediate that only exists bonded."""
     can_project = metal_glyph_up is not None and "projection" in metal_glyph_up
+    can_purify = metal_glyph_up is not None and "purification" in metal_glyph_up
     can_reject = metal_glyph_down is not None and "rejection" in metal_glyph_down
-    has_proliferation = (
-        needs_proliferation
-        and (has_quicksilver or can_get_quicksilver_via_rejection)
-        and bool(pf.parts_available & PART_PROLIFERATION)
-        and bool(pf.parts_available & PART_RAVARI)
-    )
-    single_quicksilver = (
-        ATOM_QUICKSILVER in single_atom_input_types
-        or (can_reject and any(m in single_atom_input_types for m in METAL_CHAIN[1:]))
-        or (can_reject and metal_glyph_up is not None and METAL_CHAIN[0] in single_atom_input_types)
-    )
-    needs_debond = any(
-        (
-            not _synthesizable_single(
-                atype, single_atom_input_types, metal_glyph_up, metal_glyph_down,
-                single_salt, single_quicksilver, has_proliferation,
-                needs_baron_duplication, needs_dispersion, needs_animismus, needs_unification,
-            ) if is_single else
-            any(src in input_bond_sigs for src in srcs)
+    if needs_proliferation:
+        assert has_quicksilver or can_get_quicksilver_via_rejection
+        assert pf.parts_available & PART_PROLIFERATION and pf.parts_available & PART_RAVARI
+    single_quicksilver = _resolve_single_quicksilver(single_atom_input_types, can_reject, metal_glyph_up)
+
+    def synthesizable_single(x):
+        return _synthesizable_single(
+            x, single_atom_input_types, metal_glyph_up, metal_glyph_down,
+            single_salt, single_quicksilver, needs_proliferation,
+            needs_baron_duplication, needs_dispersion, needs_animismus, needs_unification,
         )
-        and not any(
-            _bond_signature_compatible(
-                in_sig, out_sig, reference_is_earlier=True,
-                needs_calc=needs_calcification, needs_dup=needs_baron_duplication,
-                has_rejection=can_reject, has_projection=can_project,
-            )
-            for src in srcs
-            for in_sig in input_bond_sigs.get(src, ())
-            if src == atype or None in in_sig
-        )
-        for atype, out_sigs in output_bond_sigs.items()
-        for out_sig in out_sigs
-        for srcs in [_transform_source_types(
-            atype, out_sig, needs_calcification, needs_baron_duplication, can_reject, can_project,
-            require_space=False)]
-        for is_single in [all(s is None for s in out_sig)]
+
+    needs_debond = _needs_bond_action(
+        output_bond_sigs, input_bond_sigs, reference_is_earlier=True,
+        needs_calc=needs_calcification, needs_dup=needs_baron_duplication,
+        has_rejection=can_reject, has_projection=can_project,
+        synthesizable_single=synthesizable_single,
     )
     single_metal_input_types = {
         a.type for mol in pf.inputs if len(mol.atoms) == 1 and mol.atoms[0].type in METAL_CHAIN
@@ -1117,71 +1182,132 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
         a.type for mol in pf.outputs if len(mol.atoms) == 1 and mol.atoms[0].type in METAL_CHAIN
         for a in mol.atoms
     }
+    metal_output_types = {a.type for mol in pf.outputs for a in mol.atoms if a.type in METAL_CHAIN}
+
     def metal_reachable(i, m, available):
         return (
             (have_up_glyph and any(lower in available for lower in METAL_CHAIN[:i]))
             or (has_rejection and any(higher in available for higher in METAL_CHAIN[i + 1:]))
-            or (has_division and any(
-                higher in available and m in _DIVISION_REACHABLE.get(higher, ())
-                for higher in METAL_CHAIN[i + 1:]
-            ))
+            or (has_division and _division_reachable_from(m, available, have_up_glyph))
         )
-    needs_metal_debond = any(
+
+    needs_metal_single_debond = any(
         m in single_metal_output_types
         and m not in single_metal_input_types
         and metal_reachable(i, m, input_atom_types)
         and not metal_reachable(i, m, single_metal_input_types)
         for i, m in enumerate(METAL_CHAIN)
     )
+    would_need_via_projection = can_project and not single_quicksilver
+    would_need_via_purification = can_purify and any(
+        m in metal_output_types
+        and m not in input_atom_types
+        and not any(lower in single_metal_input_types for lower in METAL_CHAIN[:i])
+        for i, m in enumerate(METAL_CHAIN)
+    )
+    needs_metal_up_debond = force_up and not force_down and (
+        (would_need_via_projection and would_need_via_purification)
+        if (can_project and can_purify) else
+        (would_need_via_projection or would_need_via_purification)
+    )
+    would_need_via_division = metal_glyph_down == "division" and any(
+        m in metal_output_types
+        and m not in input_atom_types
+        and not any(higher in single_metal_input_types for higher in METAL_CHAIN[i + 1:])
+        for i, m in enumerate(METAL_CHAIN)
+    )
+    needs_metal_down_debond = force_down and not force_up and would_need_via_division
     needs_unbonder = (
         (needs_animismus and not single_salt)
         or (needs_dispersion and not single_quintessence)
         or (needs_unification and not (single_all_elementals or (needs_baron_duplication and single_salt)))
+        or needs_metal_up_debond
+        or needs_metal_down_debond
         or needs_debond
-        or needs_metal_debond
+        or needs_metal_single_debond
     )
-    needs_bonder = any(
-        any(src in input_bond_sigs for src in srcs)
-        and not any(
-            _bond_signature_compatible(
-                out_sig, in_sig, normal_only=True, reference_is_earlier=False,
-                needs_calc=needs_calcification, needs_dup=needs_baron_duplication,
-                has_rejection=can_reject, has_projection=can_project,
-            )
-            for src in srcs
-            for in_sig in input_bond_sigs.get(src, ())
-            if src == atype or None in in_sig
-        )
-        for atype, out_sigs in output_bond_sigs.items()
-        for out_sig in out_sigs
-        for srcs in [_transform_source_types(
-            atype, out_sig, needs_calcification, needs_baron_duplication, can_reject, can_project,
-            require_space=False)]
+    needs_bonder = _needs_bond_action(
+        output_bond_sigs, input_bond_sigs, reference_is_earlier=False, normal_only=True,
+        needs_calc=needs_calcification, needs_dup=needs_baron_duplication,
+        has_rejection=can_reject, has_projection=can_project,
     )
-    needs_bonder_prisma = any(
-        atype in input_bond_sigs
-        and not any(
-            _bond_signature_compatible(
-                out_sig, in_sig, triplex_only=True, reference_is_earlier=False,
-                needs_calc=needs_calcification, needs_dup=needs_baron_duplication,
-                has_rejection=can_reject, has_projection=can_project,
-            )
-            for in_sig in input_bond_sigs[atype]
-        )
-        for atype, out_sigs in output_bond_sigs.items()
-        for out_sig in out_sigs
+    needs_bonder_prisma = _needs_bond_action(
+        output_bond_sigs, input_bond_sigs, reference_is_earlier=False, triplex_only=True,
+        needs_calc=needs_calcification, needs_dup=needs_baron_duplication,
+        has_rejection=can_reject, has_projection=can_project,
     )
+    return needs_bonder, needs_unbonder, needs_bonder_prisma
+
+
+def _resolve_star_bond(pf: PuzzleFile, output_bond_sigs: dict,
+                        needs_bonder_prisma: bool, needs_unbonder: bool) -> bool:
+    """An extra +2 track floor for a fully-surrounded (6-bonded) output
+    atom built entirely from single-atom inputs — the star-bond case (see
+    P025-Water-Purifier) — but only when that structure isn't already
+    accounted for by a bonder-prisma or unbonder requirement, and
+    type-agnostically (a ring whose center atom changes identity via a
+    metal-chain transform, e.g. P022's iron->copper, still counts)."""
     has_output_star = any(
         all(slot is not None for slot in out_sig)
         for out_sigs in output_bond_sigs.values()
         for out_sig in out_sigs
     )
-    needs_star_tracks = (
+    return (
         has_output_star
         and all(len(mol.atoms) == 1 for mol in pf.inputs)
         and not needs_bonder_prisma
         and not needs_unbonder
     )
+
+
+def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
+    """
+    Which extra parts a solution is provably forced to buy, from atom-type
+    and bond-type presence/absence between inputs and outputs, plus how
+    much Track that forces (needed["tracks"], needed["access"] — see
+    cost_lower_bound's docstring for the exact access/track rules).
+    Shared by cost_lower_bound and area_lower_bound.
+    """
+    input_atom_types: set[int] = set()
+    for mol in pf.inputs:
+        input_atom_types.update(a.type for a in mol.atoms)
+    output_atom_types: set[int] = set()
+    for mol in pf.outputs:
+        output_atom_types.update(a.type for a in mol.atoms)
+
+    has_projection = bool(pf.parts_available & PART_PROJECTION)
+    has_purification = bool(pf.parts_available & PART_PURIFICATION)
+    has_rejection = bool(pf.parts_available & PART_REJECTION)
+    has_division = bool(pf.parts_available & PART_DIVISION)
+    have_up_glyph = has_projection or has_purification
+    has_quicksilver = ATOM_QUICKSILVER in input_atom_types
+    can_get_quicksilver_via_rejection = has_rejection and any(
+        m2 in input_atom_types for m2 in METAL_CHAIN[1:]
+    )
+    # metals
+    force_up, force_down, either_ok, needs_proliferation, metal_glyph_up, metal_glyph_down = (
+        _resolve_metal_chain_forcing(
+            input_atom_types, output_atom_types, has_projection, has_purification,
+            has_rejection, has_division, has_quicksilver,
+        )
+    )
+    # other atoms
+    (needs_calcification, needs_animismus, needs_dispersion, needs_unification,
+     needs_baron_duplication, single_atom_input_types, single_salt,
+     single_quintessence, single_all_elementals) = _resolve_elemental_glyphs(
+        pf, input_atom_types, output_atom_types,
+    )
+    # bonds
+    input_bond_sigs = _bond_signatures_by_type(pf.inputs)
+    output_bond_sigs = _bond_signatures_by_type(pf.outputs)
+    needs_bonder, needs_unbonder, needs_bonder_prisma = _resolve_bond_actions(
+        pf, input_atom_types, input_bond_sigs, output_bond_sigs,
+        have_up_glyph, has_rejection, has_division, metal_glyph_up, metal_glyph_down, force_up, force_down,
+        needs_calcification, needs_baron_duplication, needs_animismus, needs_dispersion, needs_unification,
+        single_atom_input_types, single_salt, single_quintessence, single_all_elementals,
+        has_quicksilver, can_get_quicksilver_via_rejection, needs_proliferation,
+    )
+    needs_star_tracks = _resolve_star_bond(pf, output_bond_sigs, needs_bonder_prisma, needs_unbonder)
 
     needed = {
         "bonder": needs_bonder,
@@ -1195,19 +1321,8 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
         "metal_either": either_ok,
         "metal_glyph_up": metal_glyph_up,  # None | "projection" | "purification" | "projection-or-purification" | "projection-or-purification-no-quicksilver"
         "metal_glyph_down": metal_glyph_down,  # None | "rejection" | "division" | "rejection-or-division"
-        "ravari_proliferation": (
-            needs_proliferation
-            and has_quicksilver
-            and bool(pf.parts_available & PART_PROLIFERATION)
-            and bool(pf.parts_available & PART_RAVARI)
-        ),
-        "ravari_proliferation_reject": (
-            needs_proliferation
-            and not has_quicksilver
-            and can_get_quicksilver_via_rejection
-            and bool(pf.parts_available & PART_PROLIFERATION)
-            and bool(pf.parts_available & PART_RAVARI)
-        ),
+        "ravari_proliferation": needs_proliferation and has_quicksilver,
+        "ravari_proliferation_reject": needs_proliferation and not has_quicksilver,
         "animismus": needs_animismus,
         "dispersion": needs_dispersion,
         "unification": needs_unification,
@@ -1215,12 +1330,10 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
     return needed
 
 
-def _tracks_access(pf: PuzzleFile, recipe: RecipeResult, needed: dict,
-                    use_metal_up: bool, use_metal_down: bool) -> tuple[int, int, int, Optional[str], Optional[str], str]:
-    """Access-point/Track accounting for cost_lower_bound, parameterized by
-    which metal-glyph direction(s) this call actually buys since
-    purification/division each carry their own extra track/access cost
-    beyond projection/rejection's."""
+def _resolve_metal_glyphs(needed: dict, use_metal_up: bool, use_metal_down: bool) -> tuple[Optional[str], Optional[str]]:
+    """Collapse _needed_parts's ambiguous metal_glyph_up/down labels
+    ("...-or-...", "...-no-quicksilver") into the concrete glyph each
+    direction resolves to, given which direction(s) are actually being bought"""
     metal_glyph_up = needed["metal_glyph_up"] if use_metal_up else None
     metal_glyph_down = needed["metal_glyph_down"] if use_metal_down else None
     if metal_glyph_up == "projection-or-purification-no-quicksilver":
@@ -1230,11 +1343,21 @@ def _tracks_access(pf: PuzzleFile, recipe: RecipeResult, needed: dict,
         metal_glyph_up = "projection"
     if metal_glyph_down == "rejection-or-division":
         metal_glyph_down = "rejection"
+    return metal_glyph_up, metal_glyph_down
+
+
+def _tracks_access(pf: PuzzleFile, recipe: RecipeResult, needed: dict,
+                    use_metal_up: bool, use_metal_down: bool) -> tuple[int, int, int, Optional[str], Optional[str], str]:
+    """Access-point/Track accounting for cost_lower_bound, parameterized by
+    which metal-glyph direction(s) this call actually buys since
+    purification/division each carry their own extra track/access cost
+    beyond projection/rejection's."""
+    metal_glyph_up, metal_glyph_down = _resolve_metal_glyphs(needed, use_metal_up, use_metal_down)
     needs_extra_rejection = needed["ravari_proliferation_reject"] and metal_glyph_down != "rejection"
 
     tracks = 0
     if needed["dispersion"]:
-        tracks = max(tracks, 2)
+        tracks = max(tracks, 4)
     if needed["unification"]:
         tracks = max(tracks, 3)
     if metal_glyph_up == "purification":
@@ -1293,10 +1416,8 @@ def _tracks_access(pf: PuzzleFile, recipe: RecipeResult, needed: dict,
             ATOM_SALT in single_atom_input_types
             or (needed["calcification"] and bool(single_atom_input_types & ELEMENTALS))
         )
-        single_quicksilver = (
-            ATOM_QUICKSILVER in single_atom_input_types
-            or (metal_glyph_down == "rejection" and any(m in single_atom_input_types for m in METAL_CHAIN[1:]))
-        )
+        single_quicksilver = _resolve_single_quicksilver(
+            single_atom_input_types, metal_glyph_down == "rejection", metal_glyph_up)
         has_proliferation = needed["ravari_proliferation"] or needed["ravari_proliferation_reject"]
 
         def synthesizable_single(x):
@@ -1349,7 +1470,7 @@ def cost_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
         appears in some input but not in any output
       - a triplex bonder (20g) if some specific triplex bond-type appears in
         some output but not in any input
-      - a calcification glyph (10g) if salt appears in any output but no salt (only elementals) in any input
+      - a calcification glyph (10g) if salt appears in any output (or animisums is needed) but no salt (only elementals) in any input
       - a berlow wheel (30g) + duplication glyph (20g) = 50g total if any outputs contains (air/earth/fire/water) that is not in any input, and no quintessence in any input
       - i): a projection OR purification glyph (20g) if any metal output is not in any input but a lower-rank metal is
       - OR ii): a rejection OR division glyph (20 g) if any metal output is not in any input but a higher-rank metal is
@@ -1448,15 +1569,7 @@ def area_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
     needed = _needed_parts(pf, recipe)
     use_metal_up = needed["metal_up_mandatory"]
     use_metal_down = needed["metal_down_mandatory"]
-    metal_glyph_up = needed["metal_glyph_up"]
-    metal_glyph_down = needed["metal_glyph_down"]
-    if metal_glyph_up == "projection-or-purification-no-quicksilver":
-        quicksilver_free = use_metal_down and needed["metal_glyph_down"] in ("rejection", "rejection-or-division")
-        metal_glyph_up = "projection-or-purification" if quicksilver_free else "purification"
-    if metal_glyph_up == "projection-or-purification":
-        metal_glyph_up = "projection"
-    if metal_glyph_down == "rejection-or-division":
-        metal_glyph_down = "rejection"
+    metal_glyph_up, metal_glyph_down = _resolve_metal_glyphs(needed, True, True)
     up_area = 3 if metal_glyph_up == "purification" else 2
     down_area = 3 if metal_glyph_down == "division" else 2
 
