@@ -174,10 +174,31 @@ class RecipeResult:
     extra_reactions: Dict[str, Reaction] = field(default_factory=dict)  # combined synthetic reactions (see solve_recipe_combined) that reaction_counts references but build_reactions doesn't define
 
 
-def _build_recipe_lp(pf: PuzzleFile):
+def _build_recipe_lp(pf: PuzzleFile, prioritize_waste: bool = False, allow_extra_output_copies: bool = False):
     """Shared ILP construction for solve_recipe/solve_recipe_alternatives —
     see solve_recipe's docstring for the model. Returns
-    (prob, x, y, waste, reagent_group_size, big_m), unsolved."""
+    (prob, x, y, waste, reagent_group_size, big_m), unsolved.
+
+    `prioritize_waste` reorders the lexicographic objective to minimize
+    waste first (see solve_recipe_min_waste) instead of last.
+
+    `allow_extra_output_copies` adds one non-negative slack variable per
+    *output molecule* (not per atom type) — how many extra whole copies of
+    that molecule get delivered beyond the required demand, for free. A
+    puzzle's output zones happily accept more than the minimum required
+    deliveries, so an extra copy was never actually "waste" needing
+    disposal. Crucially this is a whole-molecule slack: an extra copy of a
+    bonded multi-atom output (e.g. one quicksilver bonded to one gold)
+    pulls in an extra unit of *every* atom in it together, at that
+    molecule's fixed ratio — it can't be used to launder one atom type's
+    shortfall by overproducing only the *other* atom type in the same
+    output molecule for free, the way a flat "any output atom type is free"
+    rule could (see the P095 case in bounds.py's caller: quicksilver and
+    gold are bonded 1:1 in the one output molecule, so an extra copy always
+    costs an extra gold too — it can't hide arbitrary extra quicksilver on
+    its own). Independent of `prioritize_waste` — only solve_recipe_min_waste
+    turns it on, never solve_recipe/solve_recipe_combined's exact-demand
+    accounting used elsewhere."""
     products_needed = pf.products_needed()
 
     demand: Dict[int, int] = {}
@@ -213,6 +234,11 @@ def _build_recipe_lp(pf: PuzzleFile):
 
     prob = pulp.LpProblem("recipe", pulp.LpMinimize)
 
+    extra_copies = {}
+    if allow_extra_output_copies:
+        extra_copies = {j: pulp.LpVariable(f"extra_out_{j}", lowBound=0, cat="Integer")
+                         for j in range(len(pf.outputs))}
+
     x = {i: pulp.LpVariable(f"reagent_{i}", lowBound=0, cat="Integer") for i in reagent_atoms}
     y = {r.name: pulp.LpVariable(f"reaction_{r.name}", lowBound=0, cat="Integer") for r in reactions}
     waste = {t: pulp.LpVariable(f"waste_{t}", lowBound=0, cat="Integer") for t in all_types}
@@ -227,7 +253,10 @@ def _build_recipe_lp(pf: PuzzleFile):
     for t in all_types:
         supply = pulp.lpSum(x[i] * reagent_atoms[i].get(t, 0) for i in reagent_atoms)
         produced = pulp.lpSum(y[r.name] * r.delta.get(t, 0) for r in reactions)
-        prob += supply + produced == demand.get(t, 0) + waste[t]
+        extras = pulp.lpSum(
+            extra_copies[j] * pf.outputs[j].atom_type_counts().get(t, 0) for j in extra_copies
+        )
+        prob += supply + produced == demand.get(t, 0) + waste[t] + extras
 
     for r in reactions:
         if r.catalyst is not None:
@@ -236,13 +265,24 @@ def _build_recipe_lp(pf: PuzzleFile):
         raw_supply = pulp.lpSum(x[i] * reagent_atoms[i].get(t, 0) for i in reagent_atoms)
         prob += raw_supply >= hc
 
-    # Lexicographic-ish objective: fewest reagents spawned first, then
-    # fewest reaction invocations, then least wasted atoms.
-    prob += (
-        1_000_000 * pulp.lpSum(x.values())
-        + 1_000 * pulp.lpSum(y.values())
-        + pulp.lpSum(waste.values())
-    )
+    if prioritize_waste:
+        # Least wasted atoms first, then fewest reactions, then fewest
+        # reagents — used to test whether a *restricted* reaction set can
+        # balance demand with zero waste at all, regardless of how many
+        # reagents/reactions that costs.
+        prob += (
+            1_000_000 * pulp.lpSum(waste.values())
+            + 1_000 * pulp.lpSum(y.values())
+            + pulp.lpSum(x.values())
+        )
+    else:
+        # Lexicographic-ish objective: fewest reagents spawned first, then
+        # fewest reaction invocations, then least wasted atoms.
+        prob += (
+            1_000_000 * pulp.lpSum(x.values())
+            + 1_000 * pulp.lpSum(y.values())
+            + pulp.lpSum(waste.values())
+        )
 
     return prob, x, y, waste, reagent_group_size, big_m
 
@@ -273,6 +313,31 @@ def solve_recipe(pf: PuzzleFile) -> RecipeResult:
     solve_recipe_alternatives to enumerate the others.
     """
     prob, x, y, waste, reagent_group_size, _big_m = _build_recipe_lp(pf)
+    status = prob.solve(pulp.PULP_CBC_CMD(msg=0))
+    status_str = pulp.LpStatus[status]
+    if status_str != "Optimal":
+        raise ValueError(f"no atom-balanced recipe found for {pf.name!r} (status={status_str})")
+
+    return _recipe_result(x, y, waste, reagent_group_size)
+
+
+def solve_recipe_min_waste(pf: PuzzleFile) -> RecipeResult:
+    """solve_recipe's model, but prioritizing least waste over fewest
+    reagents/reactions — used by bounds.py to test whether a *restricted*
+    set of reaction glyphs (typically just the ones already proven
+    necessary) can balance demand with zero waste at all. A puzzle where
+    every zero-waste recipe needs a reaction outside that restricted set
+    still solves here (waste absorbs the imbalance instead), just with
+    waste > 0 — the caller reads that as "restricted set is insufficient."
+
+    Extra whole copies of an output molecule are free, never counted as
+    waste (see _build_recipe_lp's allow_extra_output_copies) — only a
+    genuine byproduct with no matching output, or a shortfall that can't be
+    covered without breaking some other output molecule's fixed atom
+    ratio, can register here.
+    """
+    prob, x, y, waste, reagent_group_size, _big_m = _build_recipe_lp(
+        pf, prioritize_waste=True, allow_extra_output_copies=True)
     status = prob.solve(pulp.PULP_CBC_CMD(msg=0))
     status_str = pulp.LpStatus[status]
     if status_str != "Optimal":

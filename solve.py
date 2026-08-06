@@ -279,7 +279,7 @@ def _chapter_1_2_pids():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compute proven bounds for the optimal SUM solution.")
-    parser.add_argument("--puzzle", default='P307', metavar="ID",
+    parser.add_argument("--puzzle", default='P303', metavar="ID",
                          help="Puzzle ID (default: run every chapter 1+2 puzzle, P007-P022)")
     parser.add_argument("--workers", type=int, default=None,
                          help="Worker process count for the state-space search "
