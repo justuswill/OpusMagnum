@@ -21,6 +21,7 @@ from puzzle_parser import (
     PART_BARON, PART_PROJECTION, PART_PURIFICATION,
     PART_REJECTION, PART_DIVISION, PART_PROLIFERATION, PART_RAVARI,
     PART_CALCIFICATION, PART_DUPLICATION, PART_ANIMISMUS, PART_DISPERSION, PART_DISPOSAL,
+    PART_BONDER, PART_UNBONDER, PART_BONDER_PRISMA,
     alternate_repeat_puzzle,
 )
 from stoichiometry import (
@@ -791,6 +792,154 @@ def _bond_signatures_by_type(mols) -> dict:
     return result
 
 
+def _position_bond_signatures(mol) -> tuple:
+    """(pos_to_type, pos_to_slots) for one molecule — the per-position
+    sibling of _bond_signatures_by_type, which flattens across every
+    molecule in a list by atom type and throws the position away. The
+    whole-molecule coverage search (_molecule_coverage_reachable) needs to
+    know exactly where a candidate placement's atoms and bonds land, not
+    just that some matching signature exists somewhere."""
+    pos_to_type = {(a.u, a.v): a.type for a in mol.atoms}
+    slots = {(a.u, a.v): [None] * len(_HEX_DIRS) for a in mol.atoms}
+    for b in mol.bonds:
+        fpos, tpos = (b.from_u, b.from_v), (b.to_u, b.to_v)
+        ftype, ttype = pos_to_type.get(fpos), pos_to_type.get(tpos)
+        if ftype is None or ttype is None:
+            continue
+        fdir = (tpos[0] - fpos[0], tpos[1] - fpos[1])
+        tdir = (fpos[0] - tpos[0], fpos[1] - tpos[1])
+        if fdir in _HEX_DIRS:
+            slots[fpos][_HEX_DIRS.index(fdir)] = (b.type, ttype)
+        if tdir in _HEX_DIRS:
+            slots[tpos][_HEX_DIRS.index(tdir)] = (b.type, ftype)
+    return pos_to_type, slots
+
+
+def _molecule_placements_covering(in_sig: tuple, anchor_out_pos: tuple,
+                                   out_pos_to_type: dict, out_slots: dict,
+                                   uncovered: frozenset,
+                                   needs_calc: bool, needs_dup: bool,
+                                   has_rejection: bool, has_projection: bool):
+    """Yield one frozenset of output (u, v) positions per valid rigid
+    placement of a whole input molecule that covers `anchor_out_pos`.
+    A placement is one of the input molecule's own atoms mapped onto
+    anchor_out_pos, combined with one of 6 rotations.
+    Valid means every input atom lands on a currently-`uncovered` output
+    position whose actual atom type is _reachable_via_transform from the
+    input atom's own type (same has_space rule _bond_signature_compatible
+    already applies), and every bond the input molecule has is reproduced
+    with the exact same bond type between the correspondingly mapped
+    positions."""
+    in_pos_to_type, in_slots = in_sig
+    for anchor_in_pos in in_pos_to_type:
+        for k in range(6):
+            rot_anchor = _rotate60(anchor_in_pos[0], anchor_in_pos[1], 0, 0, k)
+            du = anchor_out_pos[0] - rot_anchor[0]
+            dv = anchor_out_pos[1] - rot_anchor[1]
+            mapping = {}
+            ok = True
+            for ip, itype in in_pos_to_type.items():
+                r = _rotate60(ip[0], ip[1], 0, 0, k)
+                op = (r[0] + du, r[1] + dv)
+                if op not in uncovered:
+                    ok = False
+                    break
+                has_space = None in in_slots[ip] or None in out_slots[op]
+                if not _reachable_via_transform(
+                    itype, out_pos_to_type[op], needs_calc, needs_dup,
+                    has_rejection, has_projection, has_space,
+                ):
+                    ok = False
+                    break
+                mapping[ip] = op
+            if not ok:
+                continue
+            for ip, op in mapping.items():
+                for d, slot in enumerate(in_slots[ip]):
+                    if slot is None:
+                        continue
+                    btype = slot[0]
+                    neighbor_ip = (ip[0] + _HEX_DIRS[d][0], ip[1] + _HEX_DIRS[d][1])
+                    neighbor_op = mapping[neighbor_ip]
+                    real_dir = (neighbor_op[0] - op[0], neighbor_op[1] - op[1])
+                    out_slot = out_slots[op][_HEX_DIRS.index(real_dir)]
+                    if out_slot is None or out_slot[0] != btype:
+                        ok = False
+                        break
+                if not ok:
+                    break
+            if ok:
+                yield frozenset(mapping.values())
+
+
+def _molecule_coverage_reachable(out_mol, input_sigs: list, synthesizable_single,
+                                  needs_calc: bool, needs_dup: bool,
+                                  has_rejection: bool, has_projection: bool,
+                                  budget: float = float("inf")) -> bool:
+    """True if out_mol's full atom set can be exactly partitioned into
+    whole, unmodified copies of pf.inputs molecules. Positions whose atom type
+    is reachable as a free atom are excluded from the coverage requirement.
+
+    Backtracking search over which whole input piece covers each
+    still-uncovered position, always picking the same canonical
+    (lexicographically smallest) uncovered position as the next anchor —
+    this makes the search a DAG over frozenset(remaining) states (two
+    different orders of independent placements can converge on the same
+    remaining set), so memoizing on that frozenset is sound. Terminates
+    without a cycle guard since a placement always covers >=1 atom, so
+    `remaining` strictly shrinks every recursive call.
+
+    `budget` bounds total states explored; on exhaustion, unresolved states
+    are treated as reachable (optimistic) rather than failed."""
+    out_pos_to_type, out_slots = _position_bond_signatures(out_mol)
+    all_positions = frozenset(
+        pos for pos, atype in out_pos_to_type.items()
+        if not synthesizable_single(atype)
+    )
+    memo: dict = {}
+    state_count = 0
+
+    def search(remaining: frozenset) -> bool:
+        nonlocal state_count
+        if not remaining:
+            return True
+        if remaining in memo:
+            return memo[remaining]
+        state_count += 1
+        if state_count > budget:
+            return True
+        anchor = min(remaining)
+        result = False
+        for in_mol, in_sig in input_sigs:
+            if len(in_sig[0]) > len(remaining):
+                continue
+            for covered in _molecule_placements_covering(
+                in_sig, anchor, out_pos_to_type, out_slots, remaining,
+                needs_calc, needs_dup, has_rejection, has_projection,
+            ):
+                if search(remaining - covered):
+                    result = True
+                    break
+            if result:
+                break
+        memo[remaining] = result
+        return result
+
+    return search(all_positions)
+
+
+def _needs_debond_coverage(pf: PuzzleFile, synthesizable_single, needs_calc: bool, needs_dup: bool,
+                            has_rejection: bool, has_projection: bool) -> bool:
+    """True if any output molecule with more than one atom can't be tiled
+    out of whole, un-debonded input pieces, so an Unbonder is actually required."""
+    input_sigs = [(mol, _position_bond_signatures(mol)) for mol in pf.inputs]
+    return any(
+        not _molecule_coverage_reachable(mol, input_sigs, synthesizable_single, needs_calc, needs_dup, has_rejection, has_projection)
+        for mol in pf.outputs
+        if len(mol.atoms) > 1
+    )
+
+
 def _reachable_via_transform(earlier: int, later: int, needs_calc: bool, needs_dup: bool,
                               has_rejection: bool, has_projection: bool, has_space: bool) -> bool:
     """True if a bonded neighbor of type `earlier` could still be sitting
@@ -809,6 +958,8 @@ def _reachable_via_transform(earlier: int, later: int, needs_calc: bool, needs_d
     if not has_space:
         return False
     if needs_dup and earlier == ATOM_SALT and later in ELEMENTALS:
+        return True
+    if needs_calc and needs_dup and earlier in ELEMENTALS and later in ELEMENTALS:
         return True
     if earlier in METAL_CHAIN and later in METAL_CHAIN:
         ei, li = METAL_CHAIN.index(earlier), METAL_CHAIN.index(later)
@@ -830,6 +981,8 @@ def _transform_source_types(atype: int, needs_calc: bool, needs_dup: bool,
         types |= ELEMENTALS
     if needs_dup and atype in ELEMENTALS:
         types.add(ATOM_SALT)
+    if needs_calc and needs_dup and atype in ELEMENTALS:
+        types |= ELEMENTALS
     if atype in METAL_CHAIN:
         li = METAL_CHAIN.index(atype)
         if has_rejection:
@@ -892,13 +1045,17 @@ def _needs_bond_action(output_bond_sigs: dict, input_bond_sigs: dict, *,
                         normal_only: bool = False, triplex_only: bool = False,
                         needs_calc: bool, needs_dup: bool,
                         has_rejection: bool, has_projection: bool,
-                        synthesizable_single=None) -> bool:
+                        synthesizable_single=None,
+                        pf: Optional[PuzzleFile] = None, relevant_part: Optional[int] = None) -> tuple:
     """Shared core of needs_debond/needs_bonder/needs_bonder_prisma: for
     every output atom's bond signature, is there a transform-reachable
     bonded input precedent compatible with it via _bond_signature_compatible?
     reference_is_earlier picks which side is the input side.
     `synthesizable_single` is required to verify if single atom outputs
-    are reachable, as that case can use non-bonded transforms."""
+    are reachable, as that case can use non-bonded transforms.
+
+    When `relevant_part` isn't available reachability has to be forced with
+    additional boning-preserving glyphs."""
     def relevant(sig):
         # Consider only molecules with relevant bonds
         return any(
@@ -908,21 +1065,52 @@ def _needs_bond_action(output_bond_sigs: dict, input_bond_sigs: dict, *,
             for s in sig
         )
 
-    def compatible(atype, out_sig, srcs):
+    def compatible_with(atype, out_sig, c, d, r, p):
+        srcs = _transform_source_types(atype, c, d, r, p)
         return any(
             _bond_signature_compatible(
                 *((in_sig, out_sig) if reference_is_earlier else (out_sig, in_sig)),
                 normal_only=normal_only, triplex_only=triplex_only,
                 reference_is_earlier=reference_is_earlier,
-                needs_calc=needs_calc, needs_dup=needs_dup,
-                has_rejection=has_rejection, has_projection=has_projection,
+                needs_calc=c, needs_dup=d, has_rejection=r, has_projection=p,
             )
             for src in srcs
             for in_sig in input_bond_sigs.get(src, ())
-            if _reachable_via_transform(src, atype, needs_calc, needs_dup, has_rejection, has_projection, None in in_sig)
+            if _reachable_via_transform(src, atype, c, d, r, p, None in in_sig)
         )
 
-    return any(
+    extra_needed = set()
+    can_fallback = pf is not None and relevant_part is not None and not (pf.parts_available & relevant_part)
+    fallback_candidates = []
+    if can_fallback:
+        fallback_candidates = [
+            (name, avail) for name, avail, already in (
+                ("calcification", bool(pf.parts_available & PART_CALCIFICATION), needs_calc),
+                ("duplication", bool(pf.parts_available & PART_DUPLICATION), needs_dup),
+                ("rejection", bool(pf.parts_available & PART_REJECTION), has_rejection),
+                ("projection", bool(pf.parts_available & PART_PROJECTION), has_projection),
+            )
+            if avail and not already
+        ]
+
+    def compatible(atype, out_sig, srcs):
+        if compatible_with(atype, out_sig, needs_calc, needs_dup, has_rejection, has_projection):
+            return True
+        if not can_fallback:
+            return False
+        for k in range(1, len(fallback_candidates) + 1):
+            for combo in itertools.combinations(fallback_candidates, k):
+                names = {n for n, _ in combo}
+                c = needs_calc or "calcification" in names
+                d = needs_dup or "duplication" in names
+                r = has_rejection or "rejection" in names
+                p = has_projection or "projection" in names
+                if compatible_with(atype, out_sig, c, d, r, p):
+                    extra_needed.update(names)
+                    return True
+        return False
+
+    result = any(
         # cant be made from bond-less inputs
         (
             (synthesizable_single is not None and not synthesizable_single(atype))
@@ -940,6 +1128,7 @@ def _needs_bond_action(output_bond_sigs: dict, input_bond_sigs: dict, *,
         for out_sig in out_sigs
         for srcs in [_transform_source_types(atype, needs_calc, needs_dup, has_rejection, has_projection)]
     )
+    return result, (extra_needed if not result else set())
 
 
 def _division_closure(m: int) -> set:
@@ -1170,12 +1359,23 @@ def _resolve_bond_actions(pf: PuzzleFile, input_atom_types: set,
             needs_baron_duplication, needs_dispersion, needs_animismus, needs_unification,
         )
 
-    needs_debond = _needs_bond_action(
+    needs_debond, debond_extra = _needs_bond_action(
         output_bond_sigs, input_bond_sigs, reference_is_earlier=True,
         needs_calc=needs_calcification, needs_dup=needs_baron_duplication,
         has_rejection=can_reject, has_projection=can_project,
         synthesizable_single=synthesizable_single,
+        pf=pf, relevant_part=PART_UNBONDER,
     )
+    if not needs_debond:
+        needs_debond = _needs_debond_coverage(
+            pf, synthesizable_single,
+            needs_calcification or "calcification" in debond_extra,
+            needs_baron_duplication or "duplication" in debond_extra,
+            can_reject or "rejection" in debond_extra,
+            can_project or "projection" in debond_extra,
+        )
+        if needs_debond:
+            debond_extra = set()
     single_metal_input_types = {
         a.type for mol in pf.inputs if len(mol.atoms) == 1 and mol.atoms[0].type in METAL_CHAIN
         for a in mol.atoms
@@ -1228,17 +1428,23 @@ def _resolve_bond_actions(pf: PuzzleFile, input_atom_types: set,
         or needs_debond
         or needs_metal_single_debond
     )
-    needs_bonder = _needs_bond_action(
+    needs_bonder, bonder_extra = _needs_bond_action(
         output_bond_sigs, input_bond_sigs, reference_is_earlier=False, normal_only=True,
         needs_calc=needs_calcification, needs_dup=needs_baron_duplication,
         has_rejection=can_reject, has_projection=can_project,
+        pf=pf, relevant_part=PART_BONDER,
     )
-    needs_bonder_prisma = _needs_bond_action(
+    needs_bonder_prisma, prisma_extra = _needs_bond_action(
         output_bond_sigs, input_bond_sigs, reference_is_earlier=False, triplex_only=True,
         needs_calc=needs_calcification, needs_dup=needs_baron_duplication,
         has_rejection=can_reject, has_projection=can_project,
+        pf=pf, relevant_part=PART_BONDER_PRISMA,
     )
-    return needs_bonder, needs_unbonder, needs_bonder_prisma
+    extra_needed = debond_extra | bonder_extra | prisma_extra
+    assert not needs_unbonder or pf.parts_available & PART_UNBONDER
+    assert not needs_bonder or pf.parts_available & PART_BONDER
+    assert not needs_bonder_prisma or pf.parts_available & PART_BONDER_PRISMA
+    return needs_bonder, needs_unbonder, needs_bonder_prisma, extra_needed
 
 
 def _resolve_star_bond(pf: PuzzleFile, output_bond_sigs: dict,
@@ -1302,7 +1508,7 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
     # bonds
     input_bond_sigs = _bond_signatures_by_type(pf.inputs)
     output_bond_sigs = _bond_signatures_by_type(pf.outputs)
-    needs_bonder, needs_unbonder, needs_bonder_prisma = _resolve_bond_actions(
+    needs_bonder, needs_unbonder, needs_bonder_prisma, extra_needed = _resolve_bond_actions(
         pf, input_atom_types, input_bond_sigs, output_bond_sigs,
         have_up_glyph, has_rejection, has_division, metal_glyph_up, metal_glyph_down, force_up, force_down,
         needs_calcification, needs_baron_duplication, needs_animismus, needs_dispersion, needs_unification,
@@ -1311,12 +1517,28 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
     )
     needs_star_tracks = _resolve_star_bond(pf, output_bond_sigs, needs_bonder_prisma, needs_unbonder)
 
+    # A fallback bond match found in _resolve_bond_actions can rely on a
+    # transform glyph nothing else in the puzzle already needed — fold
+    # those in so their cost actually gets counted. Rejection/projection
+    # reuse the existing metal_glyph_up/down machinery (cost/area/access
+    # already handled there) rather than a separate charge; they only show
+    # up in extra_needed when that direction wasn't already established
+    # (the fallback only triggers once the already-established capability
+    # fails to explain a match), so metal_glyph_up/down are None here.
+    if "projection" in extra_needed and metal_glyph_up is None:
+        metal_glyph_up = "projection"
+        force_up = True
+    if "rejection" in extra_needed and metal_glyph_down is None:
+        metal_glyph_down = "rejection"
+        force_down = True
+
     needed = {
         "bonder": needs_bonder,
         "unbonder": needs_unbonder,
         "bonder_prisma": needs_bonder_prisma,
-        "calcification": needs_calcification,
+        "calcification": needs_calcification or "calcification" in extra_needed,
         "baron_duplication": needs_baron_duplication,
+        "bare_duplication": "duplication" in extra_needed,
         "star_bond": needs_star_tracks,
         "metal_up_mandatory": force_up,
         "metal_down_mandatory": force_down,
@@ -1436,6 +1658,7 @@ def _tracks_access(pf: PuzzleFile, recipe: RecipeResult, needed: dict,
         if pf.parts_available & PART_DISPOSAL:
             needs_waste_disposal = True
         else:
+            assert pf.parts_available & PART_BONDER
             needs_bonder = True
 
     has_input_bonds = any(mol.bonds for mol in pf.inputs)
@@ -1607,6 +1830,9 @@ def cost_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
     if needed["baron_duplication"]:
         g_lo += 50  # baron=30g + glyph-duplication=20g
         reasons.append("1×baron=30g + 1×duplication=20g")
+    elif needed["bare_duplication"]:
+        g_lo += 20  # glyph-duplication alone, no baron wheel
+        reasons.append("1×duplication=20g")
     if use_metal_up:
         g_lo += 20  # projection=20g, purification=20g — same either way
         reasons.append(f"1×{metal_glyph_up}=20g")
@@ -1717,6 +1943,9 @@ def area_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
         else:
             a_lo += 7
         reasons.append("1×baron=1 + 1×duplication=2")
+    elif needed["bare_duplication"]:
+        a_lo += 2  # duplication glyph alone, no baron wheel
+        reasons.append("1×duplication=2")
     if needed["ravari_proliferation"] or needed["ravari_proliferation_reject"]:
         a_lo += 6  # todo: proliferation has 6 but only 2-3 can be under ravari
         if needed["ravari_proliferation_reject"] and not (use_metal_down and metal_glyph_down == "rejection"):
