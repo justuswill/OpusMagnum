@@ -179,6 +179,7 @@ def main(args):
         t_lo, t_note = area_lower_bound(pf, recipe_cheap)
     else:
         t_lo, t_note = 1, "trivial (≥1 instruction)"
+    print('hi')
     states = reachable_states(pf, recipe, workers=args.workers, batch_size=args.batch_size)
     # print(states)
     # print()
@@ -279,7 +280,7 @@ def _chapter_1_2_pids():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compute proven bounds for the optimal SUM solution.")
-    parser.add_argument("--puzzle", default='P303', metavar="ID",
+    parser.add_argument("--puzzle", default='P270', metavar="ID",
                          help="Puzzle ID (default: run every chapter 1+2 puzzle, P007-P022)")
     parser.add_argument("--workers", type=int, default=None,
                          help="Worker process count for the state-space search "

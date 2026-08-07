@@ -139,6 +139,15 @@ class PuzzleFile:
     outputs: List[Molecule] = field(default_factory=list)
     output_scale: int = 1
     is_production: bool = False
+    # Only meaningful when is_production: whether reagent bins and output
+    # zones sit in two separate chambers (e.g. P077-Aether-Detector) —
+    # an arm in one chamber can't reach the other, and atoms can only
+    # cross via a conduit (see conduit_capacities).
+    is_isolated: bool = False
+    # Per-conduit capacity (its hex-tunnel length — the most atoms it can
+    # carry through as one connected/bonded piece), only populated when
+    # is_isolated. Empty for non-production or non-isolated puzzles.
+    conduit_capacities: List[int] = field(default_factory=list)
 
     def products_needed(self):
         return 6 * self.output_scale
@@ -279,6 +288,10 @@ class _Parser:
         outputs = [self.molecule() for _ in range(self.u32())]
         output_scale = self.u32()
         is_production = bool(self.u8())
+        is_isolated = False
+        conduit_capacities: List[int] = []
+        if is_production:
+            is_isolated, conduit_capacities = self._production_info()
         if any(a.type == ATOM_REPEAT for mol in outputs for a in mol.atoms):
             # ATOM_REPEAT is a structural marker in the output, not a real
             # atom the puzzle file lists a reagent for — but schematic.py's
@@ -293,7 +306,41 @@ class _Parser:
             outputs=outputs,
             output_scale=output_scale,
             is_production=is_production,
+            is_isolated=is_isolated,
+            conduit_capacities=conduit_capacities,
         )
+
+    def _production_info(self):
+        """Trailing struct puzzle_production_info (omsim/parse.c ~line 126
+        onward) — shrink_left/shrink_right/isolate_inputs_from_outputs,
+        then cabinets/conduits/vials. Only isolate_inputs_from_outputs and
+        each conduit's hex-tunnel length (its atom-transit capacity) are
+        kept; cabinets/vials are parsed just to advance past their bytes
+        correctly, since nothing here needs their contents."""
+        _shrink_left = self.u8()
+        _shrink_right = self.u8()
+        is_isolated = bool(self.u8())
+        for _ in range(self.u32()):  # cabinets: position (i8, i8) + type name
+            self.i8()
+            self.i8()
+            self.string()
+        conduit_capacities = []
+        for _ in range(self.u32()):  # conduits
+            self.i8()  # starting_position_a
+            self.i8()
+            self.i8()  # starting_position_b
+            self.i8()
+            n_hexes = self.u32()
+            for _ in range(n_hexes):
+                self.i8()
+                self.i8()
+            conduit_capacities.append(n_hexes)
+        for _ in range(self.u32()):  # vials: position (i8, i8) + style (u8) + count (u32)
+            self.i8()
+            self.i8()
+            self.u8()
+            self.u32()
+        return is_isolated, conduit_capacities
 
 
 def parse_puzzle(path: str) -> PuzzleFile:

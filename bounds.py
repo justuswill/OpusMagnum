@@ -1282,7 +1282,10 @@ def _resolve_metal_chain_forcing(input_atom_types: set, output_atom_types: set,
             if can_down_div and not can_down_div_direct and not can_down_rej:
                 force_up = True
         elif can_up and can_down:
-            either_ok = True
+            if can_down_rej or can_down_div_direct:
+                either_ok = True
+            else:
+                force_up = True
         else:
             needs_proliferation = True
 
@@ -1509,15 +1512,26 @@ def _resolve_star_bond(pf: PuzzleFile, output_bond_sigs: dict,
     P025-Water-Purifier) — but only when that structure isn't already
     accounted for by a bonder-prisma or unbonder requirement, and
     type-agnostically (a ring whose center atom changes identity via a
-    metal-chain transform, e.g. P022's iron->copper, still counts)."""
+    metal-chain transform, e.g. P022's iron->copper, still counts).
+
+    "Built entirely from single-atom inputs" also holds for an isolated-
+    chamber production puzzle whose narrowest usable conduit has capacity
+    1: nothing bonded can cross at all, so the star has to be built from
+    scratch out of atoms that arrive one at a time in the output chamber,
+    regardless of whether the puzzle's own reagents happen to be bonded."""
     has_output_star = any(
         all(slot is not None for slot in out_sig)
         for out_sigs in output_bond_sigs.values()
         for out_sig in out_sigs
     )
+    built_from_singles = all(len(mol.atoms) == 1 for mol in pf.inputs)
+    conduit_forces_singles = (
+        pf.is_production and pf.is_isolated
+        and pf.conduit_capacities and max(pf.conduit_capacities) == 1
+    )
     return (
         has_output_star
-        and all(len(mol.atoms) == 1 for mol in pf.inputs)
+        and (built_from_singles or conduit_forces_singles)
         and not needs_bonder_prisma
         and not needs_unbonder
     )
@@ -1570,16 +1584,20 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
         single_atom_input_types, single_salt, single_quintessence, single_all_elementals,
         has_quicksilver, can_get_quicksilver_via_rejection, needs_proliferation,
     )
-    needs_star_tracks = _resolve_star_bond(pf, output_bond_sigs, needs_bonder_prisma, needs_unbonder)
+    # production
+    freespace_needs_unbonder = needs_unbonder
+    if pf.is_production and pf.is_isolated and pf.conduit_capacities:
+        conduit_capacity = max(pf.conduit_capacities)
+        needed_input_idxs = necessary_inputs(pf, recipe)
+        if needed_input_idxs and conduit_capacity < max(len(pf.inputs[i].atoms) for i in needed_input_idxs):
+            assert pf.parts_available & PART_UNBONDER
+            needs_unbonder = True
+        if pf.outputs and conduit_capacity < max(mol.atom_count() for mol in pf.outputs):
+            assert pf.parts_available & PART_BONDER
+            needs_bonder = True
 
-    # A fallback bond match found in _resolve_bond_actions can rely on a
-    # transform glyph nothing else in the puzzle already needed — fold
-    # those in so their cost actually gets counted. Rejection/projection
-    # reuse the existing metal_glyph_up/down machinery (cost/area/access
-    # already handled there) rather than a separate charge; they only show
-    # up in extra_needed when that direction wasn't already established
-    # (the fallback only triggers once the already-established capability
-    # fails to explain a match), so metal_glyph_up/down are None here.
+    needs_star_tracks = _resolve_star_bond(pf, output_bond_sigs, needs_bonder_prisma, freespace_needs_unbonder)
+
     if "projection" in extra_needed and metal_glyph_up is None:
         metal_glyph_up = "projection"
         force_up = True
@@ -1808,12 +1826,10 @@ def _tracks_access(pf: PuzzleFile, recipe: RecipeResult, needed: dict,
     access_note = " + ".join(access_parts)
 
     baseline_tracks = tracks
-    if tracks:
-        while tracks * 6 < access:
-            tracks += 1
-    elif access > 6:
-        tracks = 1
-        while tracks * 6 < access:
+    free_access = 12 if (pf.is_production and pf.is_isolated) else 6
+    if free_access < access:
+        tracks = max(tracks, 1)
+    while max(0, tracks - 1) * 6 < access - free_access:
             tracks += 1
 
     return access, tracks, baseline_tracks, metal_glyph_up, metal_glyph_down, access_note, needs_bonder
@@ -1868,8 +1884,12 @@ def cost_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
         access, tracks, baseline_tracks, metal_glyph_up, metal_glyph_down, access_note, needs_bonder = _tracks_access(
             pf, recipe, needed, use_metal_up, use_metal_down)
 
-    g_lo = 20
-    reasons = ["1×arm=20g"]
+    if pf.is_production and pf.is_isolated:
+        g_lo = 40
+        reasons = ["2×arm=40g"]
+    else:
+        g_lo = 20
+        reasons = ["1×arm=20g"]
 
     if needs_bonder:
         g_lo += 10
@@ -1946,8 +1966,12 @@ def area_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
         else:
             use_metal_up = True
 
-    a_lo = 1  # arm base
-    reasons = ["1×arm=1"]
+    if pf.is_production and pf.is_isolated:
+        a_lo = 2  # two arm bases, one per chamber
+        reasons = ["2×arm=2"]
+    else:
+        a_lo = 1  # arm base
+        reasons = ["1×arm=1"]
 
     if needed["bonder"]:
         a_lo += 2
