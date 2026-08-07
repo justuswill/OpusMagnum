@@ -1041,12 +1041,17 @@ def _bond_signature_compatible(reference: list, candidate: list,
 
 
 def _needs_bond_action(output_bond_sigs: dict, input_bond_sigs: dict, *,
+                        pf: PuzzleFile, relevant_part: int,
                         reference_is_earlier: bool,
                         normal_only: bool = False, triplex_only: bool = False,
                         needs_calc: bool, needs_dup: bool,
                         has_rejection: bool, has_projection: bool,
                         synthesizable_single=None,
-                        pf: Optional[PuzzleFile] = None, relevant_part: Optional[int] = None) -> tuple:
+                        single_atom_input_types: Optional[set] = None,
+                        metal_glyph_up: Optional[str] = None, metal_glyph_down: Optional[str] = None,
+                        single_salt: bool = False, single_quicksilver: bool = False,
+                        needs_proliferation: bool = False, needs_animismus: bool = False,
+                        needs_dispersion: bool = False, needs_unification: bool = False) -> tuple:
     """Shared core of needs_debond/needs_bonder/needs_bonder_prisma: for
     every output atom's bond signature, is there a transform-reachable
     bonded input precedent compatible with it via _bond_signature_compatible?
@@ -1054,8 +1059,10 @@ def _needs_bond_action(output_bond_sigs: dict, input_bond_sigs: dict, *,
     `synthesizable_single` is required to verify if single atom outputs
     are reachable, as that case can use non-bonded transforms.
 
-    When `relevant_part` isn't available reachability has to be forced with
-    additional boning-preserving glyphs."""
+    When `relevant_part` isn't available, a fallback search tries
+    sets of (calcification, duplication, rejection, projection,
+    animismus, dispersion, unification, proliferation), smallest first,
+    elevated to their raw part availability."""
     def relevant(sig):
         # Consider only molecules with relevant bonds
         return any(
@@ -1080,50 +1087,82 @@ def _needs_bond_action(output_bond_sigs: dict, input_bond_sigs: dict, *,
         )
 
     extra_needed = set()
-    can_fallback = pf is not None and relevant_part is not None and not (pf.parts_available & relevant_part)
+    can_fallback = not (pf.parts_available & relevant_part)
+    allow_single_synth = reference_is_earlier and bool(pf.parts_available & (PART_BONDER | PART_BONDER_PRISMA))
     fallback_candidates = []
     if can_fallback:
         fallback_candidates = [
             (name, avail) for name, avail, already in (
+                # bonded
                 ("calcification", bool(pf.parts_available & PART_CALCIFICATION), needs_calc),
                 ("duplication", bool(pf.parts_available & PART_DUPLICATION), needs_dup),
                 ("rejection", bool(pf.parts_available & PART_REJECTION), has_rejection),
                 ("projection", bool(pf.parts_available & PART_PROJECTION), has_projection),
+                # others
+                # todo: add purification / division
+                ("animismus", bool(pf.parts_available & PART_ANIMISMUS), needs_animismus),
+                ("dispersion", bool(pf.parts_available & PART_DISPERSION), needs_dispersion),
+                ("unification", bool(pf.parts_available & PART_DISPERSION), needs_unification),
+                ("proliferation", bool(pf.parts_available & PART_PROLIFERATION), needs_proliferation),
             )
             if avail and not already
         ]
 
+    def matches_with(atype, out_sig, names):
+        c = needs_calc or "calcification" in names
+        d = needs_dup or "duplication" in names
+        r = has_rejection or "rejection" in names
+        p = has_projection or "projection" in names
+        if compatible_with(atype, out_sig, c, d, r, p):
+            return True
+        if allow_single_synth and single_atom_input_types is not None:
+            mg_up = metal_glyph_up if metal_glyph_up is not None else ("projection" if "projection" in names else None)
+            mg_down = metal_glyph_down if metal_glyph_down is not None else ("rejection" if "rejection" in names else None)
+            elevated_salt = single_salt or (c and bool(single_atom_input_types & ELEMENTALS))
+            elevated_quicksilver = single_quicksilver or (
+                r and any(m in single_atom_input_types for m in METAL_CHAIN[1:])
+            )
+            an = needs_animismus or "animismus" in names
+            di = needs_dispersion or "dispersion" in names
+            un = needs_unification or "unification" in names
+            pr = needs_proliferation or "proliferation" in names
+            if _synthesizable_single(atype, single_atom_input_types, mg_up, mg_down,
+                                      elevated_salt, elevated_quicksilver, pr, d, di, an, un):
+                return True
+        return False
+
     def compatible(atype, out_sig, srcs):
-        if compatible_with(atype, out_sig, needs_calc, needs_dup, has_rejection, has_projection):
+        if matches_with(atype, out_sig, set()):
             return True
         if not can_fallback:
             return False
+        if not matches_with(atype, out_sig, {n for n, _ in fallback_candidates}):
+            return False
+        # todo: verify this finds optimal metal glyphs (account for downstream track costs etc)
         for k in range(1, len(fallback_candidates) + 1):
             for combo in itertools.combinations(fallback_candidates, k):
                 names = {n for n, _ in combo}
-                c = needs_calc or "calcification" in names
-                d = needs_dup or "duplication" in names
-                r = has_rejection or "rejection" in names
-                p = has_projection or "projection" in names
-                if compatible_with(atype, out_sig, c, d, r, p):
+                if matches_with(atype, out_sig, names):
                     extra_needed.update(names)
                     return True
         return False
 
-    result = any(
+    def needs_action(atype, out_sig, srcs):
         # cant be made from bond-less inputs
-        (
-            (synthesizable_single is not None and not synthesizable_single(atype))
-            if all(s is None for s in out_sig) else
-            (
-                # cant be made by removing pre-existing bounds
-                relevant(out_sig) and any(src in input_bond_sigs for src in srcs)
-                if reference_is_earlier else
-                relevant(out_sig)
-            )
-        )
+        if all(s is None for s in out_sig):
+            return synthesizable_single is not None and not synthesizable_single(atype)
+        # cant be made by removing pre-existing bounds
+        if reference_is_earlier:
+            if not (relevant(out_sig) and any(src in input_bond_sigs for src in srcs)):
+                return False
+            return not compatible(atype, out_sig, srcs)
+        if not relevant(out_sig):
+            return False
         # and cant use pre-existing bounds
-        and not compatible(atype, out_sig, srcs)
+        return not compatible(atype, out_sig, srcs)
+
+    result = any(
+        needs_action(atype, out_sig, srcs)
         for atype, out_sigs in output_bond_sigs.items()
         for out_sig in out_sigs
         for srcs in [_transform_source_types(atype, needs_calc, needs_dup, has_rejection, has_projection)]
@@ -1364,11 +1403,27 @@ def _resolve_bond_actions(pf: PuzzleFile, input_atom_types: set,
         needs_calc=needs_calcification, needs_dup=needs_baron_duplication,
         has_rejection=can_reject, has_projection=can_project,
         synthesizable_single=synthesizable_single,
+        single_atom_input_types=single_atom_input_types,
+        metal_glyph_up=metal_glyph_up, metal_glyph_down=metal_glyph_down,
+        single_salt=single_salt, single_quicksilver=single_quicksilver,
+        needs_proliferation=needs_proliferation, needs_animismus=needs_animismus,
+        needs_dispersion=needs_dispersion, needs_unification=needs_unification,
         pf=pf, relevant_part=PART_UNBONDER,
     )
     if not needs_debond:
+        # todo: catch new required glyphs to avoid assert fails
+        def elevated_synthesizable_single(x):
+            return _synthesizable_single(
+                x, single_atom_input_types, metal_glyph_up, metal_glyph_down,
+                single_salt, single_quicksilver,
+                needs_proliferation or "proliferation" in debond_extra,
+                needs_baron_duplication or "duplication" in debond_extra,
+                needs_dispersion or "dispersion" in debond_extra,
+                needs_animismus or "animismus" in debond_extra,
+                needs_unification or "unification" in debond_extra,
+            )
         needs_debond = _needs_debond_coverage(
-            pf, synthesizable_single,
+            pf, elevated_synthesizable_single,
             needs_calcification or "calcification" in debond_extra,
             needs_baron_duplication or "duplication" in debond_extra,
             can_reject or "rejection" in debond_extra,
@@ -1547,9 +1602,10 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
         "metal_glyph_down": metal_glyph_down,  # None | "rejection" | "division" | "rejection-or-division"
         "ravari_proliferation": needs_proliferation and has_quicksilver,
         "ravari_proliferation_reject": needs_proliferation and not has_quicksilver,
-        "animismus": needs_animismus,
-        "dispersion": needs_dispersion,
-        "unification": needs_unification,
+        "bare_proliferation": "proliferation" in extra_needed,
+        "animismus": needs_animismus or "animismus" in extra_needed,
+        "dispersion": needs_dispersion or "dispersion" in extra_needed,
+        "unification": needs_unification or "unification" in extra_needed,
         "waste": False,
     }
 
@@ -1845,6 +1901,9 @@ def cost_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
         if needed["ravari_proliferation_reject"] and not (use_metal_down and metal_glyph_down == "rejection"):
             g_lo += 20
             reasons.append("1×rejection=20g")
+    elif needed["bare_proliferation"]:
+        g_lo += 40  # proliferation glyph alone, no ravari wheel
+        reasons.append("1×proliferation=40g")
     if needed["animismus"]:
         g_lo += 20
         reasons.append("1×animismus=20g")
@@ -1958,6 +2017,9 @@ def area_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
         else:
             a_lo += 7
         reasons.append("1×ravari=1 + 1×proliferation=2")
+    elif needed["bare_proliferation"]:
+        a_lo += 6  # proliferation glyph alone, no ravari wheel
+        reasons.append("1×proliferation=6")
 
     reasons.append(f"input atoms={input_atoms}")
     reasons.append(f"output atoms={output_atoms}")
