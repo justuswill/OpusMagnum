@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-solve.py — compute lower/upper bounds for the metrics of the optimal SUM solution.
+solve_analysis.py — compute lower/upper bounds for the metrics of the optimal SUM solution.
 
 Lower bounds come from analytic proofs in bounds.py (throughput, minimum
 part cost, molecule footprint).  Upper bounds come from the best SUM record on
@@ -11,8 +11,8 @@ Filename format: {pid}_{CAT}_{cost}g-{cycles}c-{area}a-{instructions}i.solution
 Production cats have a _P suffix; their SUM metric is g+c+i (not g+c+a).
 
 Usage:
-  python solve.py --puzzle P007
-  python solve.py --puzzle w1611998067
+  python solve_analysis.py --puzzle P007
+  python solve_analysis.py --puzzle w1611998067
 """
 
 import argparse
@@ -280,8 +280,7 @@ def _chapter_1_2_pids():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compute proven bounds for the optimal SUM solution.")
-    parser.add_argument("--puzzle", default='P270', metavar="ID",
-                         help="Puzzle ID (default: run every chapter 1+2 puzzle, P007-P022)")
+    parser.add_argument("--puzzle", default='P270', metavar="ID", help="Puzzle ID")
     parser.add_argument("--workers", type=int, default=None,
                          help="Worker process count for the state-space search "
                               "(default: os.process_cpu_count())")

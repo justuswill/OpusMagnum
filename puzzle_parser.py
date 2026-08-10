@@ -74,6 +74,19 @@ PART_RAVARI        = 1 << 29  # ravari's wheel
 BARON_WHEEL_ATOMS  = frozenset({ATOM_SALT, ATOM_AIR, ATOM_EARTH, ATOM_FIRE, ATOM_WATER})
 RAVARI_WHEEL_ATOMS = frozenset({ATOM_IRON, ATOM_COPPER, ATOM_SILVER, ATOM_GOLD, ATOM_LEAD, ATOM_TIN})
 
+# Interior hex count of each named cabinet shape a production puzzle can
+# place (omsim/decode.c cabinet_insides_*), counted directly from those
+# arrays: Small=7, SmallWide=10, SmallWider=13, Medium=19, MediumWide=24,
+# Large=37.
+CABINET_INSIDES_SIZE = {
+    "Small": 7,
+    "SmallWide": 10,
+    "SmallWider": 13,
+    "Medium": 19,
+    "MediumWide": 24,
+    "Large": 37,
+}
+
 
 @dataclass
 class Atom:
@@ -148,6 +161,15 @@ class PuzzleFile:
     # carry through as one connected/bonded piece), only populated when
     # is_isolated. Empty for non-production or non-isolated puzzles.
     conduit_capacities: List[int] = field(default_factory=list)
+    # Interior hex count of each cabinet (walled sub-chamber) the puzzle
+    # provides, in file order. Every production puzzle — isolated or not —
+    # is built from one or more of these; an arm's full rotation footprint
+    # must stay within a single cabinet (omsim/decode.c's
+    # check_production_constraints flags ARM_REACHES_ACROSS_WALL
+    # otherwise), so a solution needing more than the largest cabinet's
+    # interior can't be built with one arm. Empty for non-production
+    # puzzles. See CABINET_INSIDES_SIZE.
+    cabinet_sizes: List[int] = field(default_factory=list)
 
     def products_needed(self):
         return 6 * self.output_scale
@@ -290,8 +312,9 @@ class _Parser:
         is_production = bool(self.u8())
         is_isolated = False
         conduit_capacities: List[int] = []
+        cabinet_sizes: List[int] = []
         if is_production:
-            is_isolated, conduit_capacities = self._production_info()
+            is_isolated, conduit_capacities, cabinet_sizes = self._production_info()
         if any(a.type == ATOM_REPEAT for mol in outputs for a in mol.atoms):
             # ATOM_REPEAT is a structural marker in the output, not a real
             # atom the puzzle file lists a reagent for — but schematic.py's
@@ -308,22 +331,26 @@ class _Parser:
             is_production=is_production,
             is_isolated=is_isolated,
             conduit_capacities=conduit_capacities,
+            cabinet_sizes=cabinet_sizes,
         )
 
     def _production_info(self):
         """Trailing struct puzzle_production_info (omsim/parse.c ~line 126
         onward) — shrink_left/shrink_right/isolate_inputs_from_outputs,
-        then cabinets/conduits/vials. Only isolate_inputs_from_outputs and
-        each conduit's hex-tunnel length (its atom-transit capacity) are
-        kept; cabinets/vials are parsed just to advance past their bytes
-        correctly, since nothing here needs their contents."""
+        then cabinets/conduits/vials. isolate_inputs_from_outputs, each
+        cabinet's interior size (via its type name and CABINET_INSIDES_SIZE),
+        and each conduit's hex-tunnel length (its atom-transit capacity) are
+        kept; vials are parsed just to advance past their bytes correctly,
+        since nothing here needs their contents."""
         _shrink_left = self.u8()
         _shrink_right = self.u8()
         is_isolated = bool(self.u8())
+        cabinet_sizes = []
         for _ in range(self.u32()):  # cabinets: position (i8, i8) + type name
             self.i8()
             self.i8()
-            self.string()
+            cabinet_type = self.string()
+            cabinet_sizes.append(CABINET_INSIDES_SIZE[cabinet_type])
         conduit_capacities = []
         for _ in range(self.u32()):  # conduits
             self.i8()  # starting_position_a
@@ -340,7 +367,7 @@ class _Parser:
             self.i8()
             self.u8()
             self.u32()
-        return is_isolated, conduit_capacities
+        return is_isolated, conduit_capacities, cabinet_sizes
 
 
 def parse_puzzle(path: str) -> PuzzleFile:

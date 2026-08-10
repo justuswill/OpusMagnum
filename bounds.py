@@ -514,7 +514,7 @@ def _cadence_latency(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph) ->
     keeping the smallest L_spine across all combinations.
 
     Memoized on `graph` (_cadence_latency_memo, module-level): a graph is
-    built for one specific recipe, and callers — notably solve.py's
+    built for one specific recipe, and callers — notably solve_analysis.py's
     SUM-tightening loop via cycles_lower_bound_for_budget — call this
     repeatedly with the same (pf, recipe, graph), so recomputing the
     combinations_with_replacement search every time would be pure
@@ -721,7 +721,7 @@ def cycles_lower_bound_for_budget(pf: PuzzleFile, recipe: RecipeResult, states: 
     `arm_budget` gold, delivering as many reagent grabs as `recipe` needs
     (see _min_arm_cost). Not a sound unconditional floor like
     cycles_lower_bound — only valid conditioned on a cost budget already
-    derived soundly. Used solely to tighten solve.py's SUM interval
+    derived soundly. Used solely to tighten solve_analysis.py's SUM interval
     (arm_budget there comes from a SUM-record cost ceiling minus
     cost_lower_bound's non-arm floor), never as a substitute for the
     standalone cycles (c) bound.
@@ -1884,7 +1884,12 @@ def cost_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
         access, tracks, baseline_tracks, metal_glyph_up, metal_glyph_down, access_note, needs_bonder = _tracks_access(
             pf, recipe, needed, use_metal_up, use_metal_down)
 
-    if pf.is_production and pf.is_isolated:
+    needs_second_arm = (
+        pf.is_production
+        and (pf.is_isolated
+             or (pf.cabinet_sizes and area_lower_bound(pf, recipe)[0] > max(pf.cabinet_sizes)))
+    )
+    if needs_second_arm:
         g_lo = 40
         reasons = ["2×arm=40g"]
     else:

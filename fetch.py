@@ -4,7 +4,8 @@ Fetch every puzzle tracked by zlbb.faendir.com — campaign, journal (XCIX & CVI
 DRM, and community — plus top leaderboard solutions for the key metric categories.
 
 For normal/polymer puzzles: GX (min cost>cycles·area), AX (min area>cost·cycles),
-                            CX (min cycles>cost·area), SUM (min g+c+a)
+                            CX (min cycles>cost·area), SUM (min g+c+a),
+                            GC (min cost, cycles as tiebreak)
 For production puzzles:     GX_P, CX_P, SUM_P, IX_P (instructions)
 
 Puzzle files come from the leaderboard's /om/puzzle/{id}/file endpoint.
@@ -25,7 +26,7 @@ BASE_URL = "https://zlbb.faendir.com"
 PUZZLES_DIR = os.path.join(os.path.dirname(__file__), "puzzles")
 
 # Categories to collect per puzzle type
-NORMAL_CATS   = {"GX", "AX", "CX", "SUM"}
+NORMAL_CATS   = {"GX", "AX", "CX", "SUM", "GC"}
 PRODUCTION_CATS = {"GX_P", "CX_P", "SUM_P", "IX_P"}
 PRODUCTION_TYPES = {"PRODUCTION"}
 

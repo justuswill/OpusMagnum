@@ -239,7 +239,7 @@ if __name__ == "__main__":
             # across unrelated code-path changes within one process. This
             # never affects any downstream numeric bound (bounds.py only
             # uses edge_move for a human-readable note string) — verified
-            # via full solve.py output diffs during this module's
+            # via full solve_analysis.py output diffs during this module's
             # development. Exact label match is reported as an FYI below,
             # not part of PASS/FAIL.
             p_pairs, s_pairs = set(p_edges), set(s_edges)
