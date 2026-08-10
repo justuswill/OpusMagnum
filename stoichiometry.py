@@ -93,8 +93,15 @@ class Reaction:
     # backward search may freely choose among when reversing one firing.
 
 
-def build_reactions(pf: PuzzleFile) -> List[Reaction]:
-    """All transformation-glyph reactions usable in this puzzle."""
+def build_reactions(pf: PuzzleFile, excluded_reactions: frozenset = frozenset()) -> List[Reaction]:
+    """All transformation-glyph reactions usable in this puzzle.
+
+    `excluded_reactions` drops specific named reactions even when their
+    PART bit is set — needed for dispersion/unification, which share
+    PART_DISPERSION in the game's own puzzle format (see that constant's
+    "also unification" comment) despite being fully independent
+    reactions; there's no other way to test "what if only unification
+    were available" since the bit can't be split."""
     avail = pf.parts_available
     reactions: List[Reaction] = []
 
@@ -161,7 +168,7 @@ def build_reactions(pf: PuzzleFile) -> List[Reaction]:
             delta[b] = delta.get(b, 0) + 1
             reactions.append(Reaction(f"divide_{ATOM_NAMES[m]}", delta))
 
-    return reactions
+    return [r for r in reactions if r.name not in excluded_reactions]
 
 
 @dataclass
@@ -174,7 +181,8 @@ class RecipeResult:
     extra_reactions: Dict[str, Reaction] = field(default_factory=dict)  # combined synthetic reactions (see solve_recipe_combined) that reaction_counts references but build_reactions doesn't define
 
 
-def _build_recipe_lp(pf: PuzzleFile, prioritize_waste: bool = False, allow_extra_output_copies: bool = False):
+def _build_recipe_lp(pf: PuzzleFile, prioritize_waste: bool = False, allow_extra_output_copies: bool = False,
+                      excluded_reactions: frozenset = frozenset()):
     """Shared ILP construction for solve_recipe/solve_recipe_alternatives —
     see solve_recipe's docstring for the model. Returns
     (prob, x, y, waste, reagent_group_size, big_m), unsolved.
@@ -226,7 +234,7 @@ def _build_recipe_lp(pf: PuzzleFile, prioritize_waste: bool = False, allow_extra
         sig_counts[sig] = sig_counts.get(sig, 0) + 1
     reagent_atoms = {i: pf.inputs[i].atom_type_counts() for i in set(representative.values())}
     reagent_group_size = {i: sig_counts[sig] for sig, i in representative.items()}
-    reactions = build_reactions(pf)
+    reactions = build_reactions(pf, excluded_reactions)
 
     all_types = (set(demand)
                  | {t for atoms in reagent_atoms.values() for t in atoms}
@@ -263,7 +271,17 @@ def _build_recipe_lp(pf: PuzzleFile, prioritize_waste: bool = False, allow_extra
             prob += y[r.name] <= big_m * has_catalyst[r.catalyst]
     for t, hc in has_catalyst.items():
         raw_supply = pulp.lpSum(x[i] * reagent_atoms[i].get(t, 0) for i in reagent_atoms)
-        prob += raw_supply >= hc
+        # A catalyst template doesn't have to come from a raw reagent — any
+        # atom of that type the recipe produces along the way (e.g. a metal
+        # reached via rejection) can just as well be the one held back and
+        # never sent on. Added, never subtracted, so this only ever adds an
+        # alternative way to satisfy hc — it can't make an already-feasible
+        # raw-reagent-sourced catalyst infeasible, only free ones with no
+        # raw supply of that type at all (duplication with no Baron wheel,
+        # proliferation with no Ravari wheel — the only reactions with a
+        # catalyst in the first place).
+        produced = pulp.lpSum(y[r.name] * r.delta.get(t, 0) for r in reactions if r.delta.get(t, 0) > 0)
+        prob += raw_supply + produced >= hc
 
     if prioritize_waste:
         # Least wasted atoms first, then fewest reactions, then fewest
@@ -321,7 +339,7 @@ def solve_recipe(pf: PuzzleFile) -> RecipeResult:
     return _recipe_result(x, y, waste, reagent_group_size)
 
 
-def solve_recipe_min_waste(pf: PuzzleFile) -> RecipeResult:
+def solve_recipe_min_waste(pf: PuzzleFile, excluded_reactions: frozenset = frozenset()) -> RecipeResult:
     """solve_recipe's model, but prioritizing least waste over fewest
     reagents/reactions — used by bounds.py to test whether a *restricted*
     set of reaction glyphs (typically just the ones already proven
@@ -335,9 +353,15 @@ def solve_recipe_min_waste(pf: PuzzleFile) -> RecipeResult:
     genuine byproduct with no matching output, or a shortfall that can't be
     covered without breaking some other output molecule's fixed atom
     ratio, can register here.
+
+    `excluded_reactions` (see build_reactions) lets a caller drop a
+    specific named reaction even though its PART bit is set — the only
+    way to test dispersion and unification independently, since they
+    share PART_DISPERSION.
     """
     prob, x, y, waste, reagent_group_size, _big_m = _build_recipe_lp(
-        pf, prioritize_waste=True, allow_extra_output_copies=True)
+        pf, prioritize_waste=True, allow_extra_output_copies=True,
+        excluded_reactions=excluded_reactions)
     status = prob.solve(pulp.PULP_CBC_CMD(msg=0))
     status_str = pulp.LpStatus[status]
     if status_str != "Optimal":

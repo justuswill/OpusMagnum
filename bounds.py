@@ -1099,7 +1099,8 @@ def _needs_bond_action(output_bond_sigs: dict, input_bond_sigs: dict, *,
                 ("rejection", bool(pf.parts_available & PART_REJECTION), has_rejection),
                 ("projection", bool(pf.parts_available & PART_PROJECTION), has_projection),
                 # others
-                # todo: add purification / division
+                ("purification", bool(pf.parts_available & PART_PURIFICATION), has_projection),
+                ("division", bool(pf.parts_available & PART_DIVISION), has_rejection),
                 ("animismus", bool(pf.parts_available & PART_ANIMISMUS), needs_animismus),
                 ("dispersion", bool(pf.parts_available & PART_DISPERSION), needs_dispersion),
                 ("unification", bool(pf.parts_available & PART_DISPERSION), needs_unification),
@@ -1116,8 +1117,10 @@ def _needs_bond_action(output_bond_sigs: dict, input_bond_sigs: dict, *,
         if compatible_with(atype, out_sig, c, d, r, p):
             return True
         if allow_single_synth and single_atom_input_types is not None:
-            mg_up = metal_glyph_up if metal_glyph_up is not None else ("projection" if "projection" in names else None)
-            mg_down = metal_glyph_down if metal_glyph_down is not None else ("rejection" if "rejection" in names else None)
+            dv = (metal_glyph_down is not None and "division" in metal_glyph_down) or "division" in names
+            pu = (metal_glyph_up is not None and "purification" in metal_glyph_up) or "purification" in names
+            mg_up = "projection-or-purification" if p and pu else "projection" if p else "purification" if pu else None
+            mg_down = "rejection-or-division" if r and dv else "rejection" if r else "division" if dv else None
             elevated_salt = single_salt or (c and bool(single_atom_input_types & ELEMENTALS))
             elevated_quicksilver = single_quicksilver or (
                 r and any(m in single_atom_input_types for m in METAL_CHAIN[1:])
@@ -1136,16 +1139,15 @@ def _needs_bond_action(output_bond_sigs: dict, input_bond_sigs: dict, *,
             return True
         if not can_fallback:
             return False
-        if not matches_with(atype, out_sig, {n for n, _ in fallback_candidates}):
+        full_names = {n for n, _ in fallback_candidates}
+        if not matches_with(atype, out_sig, full_names):
             return False
-        # todo: verify this finds optimal metal glyphs (account for downstream track costs etc)
-        for k in range(1, len(fallback_candidates) + 1):
-            for combo in itertools.combinations(fallback_candidates, k):
-                names = {n for n, _ in combo}
-                if matches_with(atype, out_sig, names):
-                    extra_needed.update(names)
-                    return True
-        return False
+        required = {
+            n for n in full_names
+            if not matches_with(atype, out_sig, full_names - {n})
+        }
+        extra_needed.update(required)
+        return True
 
     def needs_action(atype, out_sig, srcs):
         # cant be made from bond-less inputs
@@ -1505,36 +1507,115 @@ def _resolve_bond_actions(pf: PuzzleFile, input_atom_types: set,
     return needs_bonder, needs_unbonder, needs_bonder_prisma, extra_needed
 
 
-def _resolve_star_bond(pf: PuzzleFile, output_bond_sigs: dict,
-                        needs_bonder_prisma: bool, needs_unbonder: bool) -> bool:
-    """An extra +2 track floor for a fully-surrounded (6-bonded) output
-    atom built entirely from single-atom inputs — the star-bond case (see
-    P025-Water-Purifier) — but only when that structure isn't already
-    accounted for by a bonder-prisma or unbonder requirement, and
-    type-agnostically (a ring whose center atom changes identity via a
-    metal-chain transform, e.g. P022's iron->copper, still counts).
-
-    "Built entirely from single-atom inputs" also holds for an isolated-
-    chamber production puzzle whose narrowest usable conduit has capacity
-    1: nothing bonded can cross at all, so the star has to be built from
-    scratch out of atoms that arrive one at a time in the output chamber,
-    regardless of whether the puzzle's own reagents happen to be bonded."""
-    has_output_star = any(
-        all(slot is not None for slot in out_sig)
-        for out_sigs in output_bond_sigs.values()
-        for out_sig in out_sigs
+def _has_star_shape(bond_sigs: dict) -> bool:
+    """True if some atom instance in `bond_sigs` is fully surrounded (all 6
+    hex directions bonded) — the star-bond case, see P025-Water-Purifier."""
+    return any(
+        all(slot is not None for slot in sig)
+        for sigs in bond_sigs.values()
+        for sig in sigs
     )
+
+
+def _has_tetra_shape(mols) -> bool:
+    """True if some atom instance, in a molecule of exactly 4 atoms, has
+    exactly 3 bonds spaced 120° apart (every other of the 6 hex
+    directions) — the tetra-bond case, e.g. P024-Alcohol-Separation's water
+    atom bonded to salt/salt/fire. Restricted to a bare 4-atom
+    hub-and-3-leaves molecule: once other atoms are attached to the leaves
+    (e.g. a ring — see P031b/P207's 7-atom wheel, whose "hub" atom has the
+    same 3-bonds-at-120° signature but isn't this shape), a normal arm can
+    approach without the extra reach this shape otherwise forces."""
+    for mol in mols:
+        if len(mol.atoms) != 4:
+            continue
+        for sigs in _bond_signatures_by_type([mol]).values():
+            for sig in sigs:
+                filled = frozenset(i for i, slot in enumerate(sig) if slot is not None)
+                if filled in ({0, 2, 4}, {1, 3, 5}):
+                    return True
+    return False
+
+
+def _resolve_star_bond(pf: PuzzleFile, input_bond_sigs: dict, output_bond_sigs: dict,
+                        needs_bonder: bool, needs_bonder_prisma: bool,
+                        needs_unbonder: bool) -> tuple[bool, bool]:
+    """An extra +2 track floor for a fully-surrounded (6-bonded) atom (see
+    _has_star_shape) on either side of the recipe, type-agnostically (a
+    ring whose center atom changes identity via a metal-chain transform,
+    e.g. P022's iron->copper, still counts):
+
+      - forward: the star is in the *output*, built entirely from
+        single-atom inputs — the arm assembling it has to reach around the
+        star's own bonds — but only when that isn't already accounted for
+        by a bonder-prisma or unbonder requirement elsewhere.
+      - reverse: the star is in the *input*, torn down to single-atom
+        outputs — the arm disassembling it needs the same reach — but only
+        when no bonder of any kind (plain or prisma) is already required
+        elsewhere (an unbonder is expected here; it's what does the
+        tearing-down and doesn't cancel this).
+
+    "Built/torn down to single atoms" also holds for an isolated-chamber
+    production puzzle whose narrowest usable conduit has capacity 1:
+    nothing bonded can cross at all, so the star has to be built (or torn
+    down) out of atoms that arrive/leave one at a time through the conduit,
+    regardless of whether the puzzle's own reagents happen to be bonded.
+    Returned as (forward, reverse) rather than a single bool because an
+    isolated production puzzle needing both at once pays the +2 floor
+    twice — once per chamber, since track in one chamber can't serve the
+    other (see _tracks_access)."""
     built_from_singles = all(len(mol.atoms) == 1 for mol in pf.inputs)
+    torn_down_to_singles = all(len(mol.atoms) == 1 for mol in pf.outputs)
     conduit_forces_singles = (
         pf.is_production and pf.is_isolated
         and pf.conduit_capacities and max(pf.conduit_capacities) == 1
     )
-    return (
-        has_output_star
+    forward = (
+        _has_star_shape(output_bond_sigs)
         and (built_from_singles or conduit_forces_singles)
         and not needs_bonder_prisma
         and not needs_unbonder
     )
+    reverse = (
+        _has_star_shape(input_bond_sigs)
+        and (torn_down_to_singles or conduit_forces_singles)
+        and not needs_bonder
+        and not needs_bonder_prisma
+    )
+    return forward, reverse
+
+
+def _resolve_tetra_bond(pf: PuzzleFile, needs_bonder: bool, needs_bonder_prisma: bool,
+                         needs_unbonder: bool) -> tuple[bool, bool]:
+    """Bare 4-atom hub-and-3-leaves shape (see _has_tetra_shape), forward
+    and reverse — mirrors _resolve_star_bond's two directions and
+    exclusions exactly, but unlike star-bond, *neither* direction adds a
+    track floor directly. See _tracks_access, where each instead
+    escalates its own bond-action's access requirement from 1 to 2
+    (reaching all 3 branches takes more than a single approach), and the
+    ordinary access/track formula converts that into whatever extra track
+    it actually costs — which can be nothing at all, if the puzzle already
+    had enough access headroom (see P021-Courage-Potion, forward-tetra's
+    exact mirror of P024-Alcohol-Separation's reverse case)."""
+    built_from_singles = all(len(mol.atoms) == 1 for mol in pf.inputs)
+    torn_down_to_singles = all(len(mol.atoms) == 1 for mol in pf.outputs)
+    conduit_forces_singles = (
+        pf.is_production and pf.is_isolated
+        and pf.conduit_capacities and max(pf.conduit_capacities) == 1
+    )
+    forward = (
+        _has_tetra_shape(pf.outputs)
+        and (built_from_singles or conduit_forces_singles)
+        and not needs_bonder_prisma
+        and not needs_unbonder
+    )
+    reverse = (
+        _has_tetra_shape(pf.inputs)
+        and (torn_down_to_singles or conduit_forces_singles)
+        and not needs_bonder
+        and not needs_bonder_prisma
+    )
+    return forward, reverse
 
 
 def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
@@ -1586,6 +1667,7 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
     )
     # production
     freespace_needs_unbonder = needs_unbonder
+    freespace_needs_bonder = needs_bonder
     if pf.is_production and pf.is_isolated and pf.conduit_capacities:
         conduit_capacity = max(pf.conduit_capacities)
         needed_input_idxs = necessary_inputs(pf, recipe)
@@ -1595,8 +1677,6 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
         if pf.outputs and conduit_capacity < max(mol.atom_count() for mol in pf.outputs):
             assert pf.parts_available & PART_BONDER
             needs_bonder = True
-
-    needs_star_tracks = _resolve_star_bond(pf, output_bond_sigs, needs_bonder_prisma, freespace_needs_unbonder)
 
     if "projection" in extra_needed and metal_glyph_up is None:
         metal_glyph_up = "projection"
@@ -1612,7 +1692,10 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
         "calcification": needs_calcification or "calcification" in extra_needed,
         "baron_duplication": needs_baron_duplication,
         "bare_duplication": "duplication" in extra_needed,
-        "star_bond": needs_star_tracks,
+        "star_bond_forward": False,
+        "star_bond_reverse": False,
+        "tetra_bond_forward": False,
+        "tetra_bond_reverse": False,
         "metal_up_mandatory": force_up,
         "metal_down_mandatory": force_down,
         "metal_either": either_ok,
@@ -1627,7 +1710,7 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
         "waste": False,
     }
 
-    if not needed["bonder"]:
+    if not needed["bonder"] or pf.is_production:
         base_parts = 0
         if needs_calcification:
             base_parts |= PART_CALCIFICATION
@@ -1669,20 +1752,147 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
         if needs_bonder_prisma and needs_calcification and needs_baron_duplication:
             allowed_waste_types |= ELEMENTALS
 
-        has_unavoidable_waste = True
-        for up_opt in up_options:
-            for down_opt in down_options:
-                restricted_pf = replace(pf, parts_available=base_parts | up_opt | down_opt)
+        def waste_type_avoidable() -> bool:
+            for up_opt in up_options:
+                for down_opt in down_options:
+                    restricted_pf = replace(pf, parts_available=base_parts | up_opt | down_opt)
+                    try:
+                        limited_recipe = solve_recipe_min_waste(restricted_pf)
+                    except ValueError:
+                        continue
+                    if all(t in allowed_waste_types for t in limited_recipe.waste):
+                        return True
+            return False
+
+        if not pf.is_production:
+            needed["waste"] = not waste_type_avoidable()
+        else:
+            assert pf.cabinet_sizes
+            needs_second_arm = (
+                pf.is_isolated
+                or area_lower_bound(pf, recipe, needed)[0] > max(pf.cabinet_sizes)
+            )
+            input_atoms = sum(pf.inputs[i].atom_count() for i in necessary_inputs(pf, recipe))
+            # At least one output molecule (the smallest one) also has to
+            # be assembled and held before it can be placed — reserve its
+            # footprint too, same generous-estimate spirit as input_atoms.
+            smallest_output = min(
+                6 * (mol.atom_count() - 1) if any(a.type == ATOM_REPEAT for a in mol.atoms)
+                else mol.atom_count()
+                for mol in pf.outputs
+            )
+            sizes = sorted(pf.cabinet_sizes, reverse=True)
+            if needs_second_arm:
+                assert len(sizes) >= 2
+                free_space = sizes[0] + sizes[1] - input_atoms - smallest_output - 2
+            else:
+                free_space = sizes[0] - input_atoms - smallest_output - 1
+            extra_chambers = len(sizes) - (2 if needs_second_arm else 1)
+            if extra_chambers > 0:
+                assert pf.conduit_capacities
+                free_space += max(pf.conduit_capacities) * extra_chambers
+
+            def acceptable(waste: Optional[dict]) -> bool:
+                if waste is None:
+                    return False
+                return sum(waste.values()) <= free_space
+
+            def waste_for(parts: int) -> Optional[dict]:
                 try:
-                    limited_recipe = solve_recipe_min_waste(restricted_pf)
+                    return solve_recipe_min_waste(replace(pf, parts_available=parts)).waste
                 except ValueError:
-                    continue
-                if all(t in allowed_waste_types for t in limited_recipe.waste):
-                    has_unavoidable_waste = False
-                    break
-            if not has_unavoidable_waste:
-                break
-        needed["waste"] = has_unavoidable_waste
+                    return None
+
+            def waste_for_excluding(reaction_name: str) -> Optional[dict]:
+
+                try:
+                    return solve_recipe_min_waste(pf, excluded_reactions=frozenset({reaction_name})).waste
+                except ValueError:
+                    return None
+
+            already_proj = metal_glyph_up is not None and "projection" == metal_glyph_up
+            already_pur = metal_glyph_up is not None and "purification" == metal_glyph_up
+            already_rej = metal_glyph_down is not None and "rejection" == metal_glyph_down
+            already_div = metal_glyph_down is not None and "division" == metal_glyph_down
+            waste_candidates = [
+                (n, p) for n, p, already in (
+                    ("calcification", PART_CALCIFICATION, needs_calcification),
+                    ("duplication", PART_DUPLICATION, needs_baron_duplication),
+                    ("projection", PART_PROJECTION, already_proj),
+                    ("purification", PART_PURIFICATION, already_pur),
+                    ("rejection", PART_REJECTION, already_rej),
+                    ("division", PART_DIVISION, already_div),
+                    ("animismus", PART_ANIMISMUS, needs_animismus),
+                    ("dispersion", PART_DISPERSION, needs_dispersion),
+                    ("unification", PART_DISPERSION, needs_unification),
+                    ("proliferation", PART_PROLIFERATION, needs_proliferation),
+                )
+                if (pf.parts_available & p) and not already
+            ]
+
+            already_fine = any(
+                acceptable(waste_for(base_parts | up_opt | down_opt))
+                for up_opt in up_options for down_opt in down_options
+            )
+            if already_fine:
+                needed["waste"] = not waste_type_avoidable()
+            elif pf.parts_available & PART_DISPOSAL:
+                # tracks_access prefers disposal anyway
+                needed["waste"] = True
+            else:
+                # Force a waste-less solution
+                assert acceptable(waste_for(pf.parts_available))
+                best_required = {
+                    name for name, p in waste_candidates
+                    if not acceptable(
+                        waste_for_excluding(name) if name in ("dispersion", "unification")
+                        else waste_for(pf.parts_available & ~p)
+                    )
+                }
+                if "calcification" in best_required:
+                    needed["calcification"] = True
+                if "duplication" in best_required:
+                    needed["bare_duplication"] = True
+                proj = "projection" in best_required
+                pur = "purification" in best_required
+                assert not (proj and pur)
+                assert not (already_proj and pur)
+                assert not (already_pur and proj)
+                if proj or pur:
+                    needed["metal_up_mandatory"] = True
+                if proj:
+                    needed["metal_glyph_up"] = "projection"
+                if pur:
+                    needed["metal_glyph_up"] = "purification"
+                rej = "rejection" in best_required
+                div = "division" in best_required
+                assert not (rej and div)
+                assert not (already_rej and div)
+                assert not (already_div and rej)
+                if rej or div:
+                    needed["metal_down_mandatory"] = True
+                if rej:
+                    needed["metal_glyph_down"] = "rejection"
+                if div:
+                    needed["metal_glyph_down"] = "division"
+                if "animismus" in best_required:
+                    needed["animismus"] = True
+                if "dispersion" in best_required:
+                    needed["dispersion"] = True
+                if "unification" in best_required:
+                    needed["unification"] = True
+                if "proliferation" in best_required:
+                    needed["bare_proliferation"] = True
+                needed["waste"] = False
+
+    bonder_signal = freespace_needs_bonder or (needed["waste"] and not (pf.parts_available & PART_DISPOSAL))
+    needed["star_bond_forward"], needed["star_bond_reverse"] = _resolve_star_bond(
+        pf, input_bond_sigs, output_bond_sigs,
+        bonder_signal, needs_bonder_prisma, freespace_needs_unbonder,
+    )
+    needed["tetra_bond_forward"], needed["tetra_bond_reverse"] = _resolve_tetra_bond(
+        pf, bonder_signal, needs_bonder_prisma, freespace_needs_unbonder,
+    )
 
     return needed
 
@@ -1711,6 +1921,9 @@ def _tracks_access(pf: PuzzleFile, recipe: RecipeResult, needed: dict,
     beyond projection/rejection's."""
     metal_glyph_up, metal_glyph_down = _resolve_metal_glyphs(needed, use_metal_up, use_metal_down)
     needs_extra_rejection = needed["ravari_proliferation_reject"] and metal_glyph_down != "rejection"
+    has_proliferation = (
+        needed["ravari_proliferation"] or needed["ravari_proliferation_reject"] or needed["bare_proliferation"]
+    )
 
     tracks = 0
     if needed["dispersion"]:
@@ -1723,7 +1936,9 @@ def _tracks_access(pf: PuzzleFile, recipe: RecipeResult, needed: dict,
         tracks = max(tracks, 2)
     if needed["animismus"]:
         tracks = max(tracks, 4)
-    if needed["star_bond"]:
+    if needed["star_bond_forward"] and needed["star_bond_reverse"] and pf.is_production and pf.is_isolated:
+        tracks = max(tracks, 4)
+    elif needed["star_bond_forward"] or needed["star_bond_reverse"]:
         tracks = max(tracks, 2)
 
     needs_bonder = needed["bonder"]
@@ -1748,15 +1963,17 @@ def _tracks_access(pf: PuzzleFile, recipe: RecipeResult, needed: dict,
             "unbonder": 2, "calcification": 1, "baron_duplication": 1,
             "metal_glyph_up": 3 if metal_glyph_up == "purification" else 2,
             "metal_glyph_down": 3 if metal_glyph_down == "division" else 2,
-            "ravari_proliferation": 2, "extra_rejection": 2,
+            "proliferation": 2, "extra_rejection": 2,
             "dispersion": 4, "unification": 3, "animismus": 4,
             "waste_disposal": 1,
         }
+        if has_proliferation:
+            tracks = max(tracks, 4)
     else:
         # zero/partial access
         access_points = {"metal_glyph_up": 3 if metal_glyph_up == "purification" else 1,
                          "metal_glyph_down": 3 if metal_glyph_down == "division" else 1,
-                         "ravari_proliferation": 2, "extra_rejection": 1,
+                         "proliferation": 2, "extra_rejection": 1,
                          "dispersion": 4, "animismus": 4, "unification": 3,
                          "waste_disposal": 1}
         multi_atom_output_types = {a.type for mol in pf.outputs if len(mol.atoms) > 1
@@ -1780,20 +1997,14 @@ def _tracks_access(pf: PuzzleFile, recipe: RecipeResult, needed: dict,
             for mol in pf.outputs if len(mol.atoms) > 1
             for mol_types in [{a.type for a in mol.atoms} - {ATOM_REPEAT}]
         )
-        # bonder/debonder
-        if needs_bonder and has_single_atom_needing_bond:
-            access_points["bonder"] = 2 if has_two_single_atoms_needing_bond else 1
-        if needed["bonder_prisma"] and has_single_atom_needing_bond and not needs_bonder:
-            access_points["bonder_prisma"] = 2 if has_two_single_atoms_needing_bond else 1
         single_atom_output_types = {a.type for mol in pf.outputs if len(mol.atoms) == 1 for a in mol.atoms}
         single_atom_input_types = {a.type for mol in pf.inputs if len(mol.atoms) == 1 for a in mol.atoms}
         single_salt = (
-            ATOM_SALT in single_atom_input_types
-            or (needed["calcification"] and bool(single_atom_input_types & ELEMENTALS))
+                ATOM_SALT in single_atom_input_types
+                or (needed["calcification"] and bool(single_atom_input_types & ELEMENTALS))
         )
         single_quicksilver = _resolve_single_quicksilver(
             single_atom_input_types, metal_glyph_down == "rejection", metal_glyph_up)
-        has_proliferation = needed["ravari_proliferation"] or needed["ravari_proliferation_reject"]
 
         def synthesizable_single(x):
             return _synthesizable_single(
@@ -1802,16 +2013,35 @@ def _tracks_access(pf: PuzzleFile, recipe: RecipeResult, needed: dict,
                 needed["baron_duplication"], needed["dispersion"], needed["animismus"], needed["unification"],
             )
 
-        if any(not synthesizable_single(x) for x in single_atom_output_types):
-            access_points["unbonder"] = 1
+        has_single_atom_needing_debond = any(not synthesizable_single(x) for x in single_atom_output_types)
+        has_two_single_atoms_needing_debond = any(
+            all(
+                not any(t in _transform_source_types(o, needed["calcification"], needed["baron_duplication"],
+                                                     needs_reject, needs_project)
+                        for o in multi_atom_output_types)
+                for t in mol_types
+            )
+            for mol in pf.inputs if len(mol.atoms) > 1
+            for mol_types in [{a.type for a in mol.atoms} - {ATOM_REPEAT}]
+        ) or (
+            not needs_bonder and not needed["bonder_prisma"]
+            and all(len(mol.atoms) <= 2 for mol in pf.inputs)
+        )
+        # bonder/debonder
+        if needs_bonder and has_single_atom_needing_bond:
+            access_points["bonder"] = 2 if (has_two_single_atoms_needing_bond or needed["tetra_bond_forward"]) else 1
+        if needed["bonder_prisma"] and has_single_atom_needing_bond and not needs_bonder:
+            access_points["bonder_prisma"] = 2 if has_two_single_atoms_needing_bond else 1
+        if needed["unbonder"] and has_single_atom_needing_debond:
+            access_points["unbonder"] = 2 if (has_two_single_atoms_needing_debond or needed["tetra_bond_reverse"]) else 1
     access_parts = [f"inputs={input_access}", f"outputs={output_access}"]
     for key, points in access_points.items():
         if key == "metal_glyph_up":
             present = metal_glyph_up is not None
         elif key == "metal_glyph_down":
             present = metal_glyph_down is not None
-        elif key == "ravari_proliferation":
-            present = needed["ravari_proliferation"] or needed["ravari_proliferation_reject"]
+        elif key == "proliferation":
+            present = has_proliferation
         elif key == "extra_rejection":
             present = needs_extra_rejection
         elif key == "waste_disposal":
@@ -1887,7 +2117,7 @@ def cost_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
     needs_second_arm = (
         pf.is_production
         and (pf.is_isolated
-             or (pf.cabinet_sizes and area_lower_bound(pf, recipe)[0] > max(pf.cabinet_sizes)))
+             or (pf.cabinet_sizes and area_lower_bound(pf, recipe, needed)[0] > max(pf.cabinet_sizes)))
     )
     if needs_second_arm:
         g_lo = 40
@@ -1951,14 +2181,15 @@ def cost_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
     return g_lo, note
 
 
-def area_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
+def area_lower_bound(pf: PuzzleFile, recipe: RecipeResult, needed: Optional[dict] = None) -> tuple[int, str]:
     """
     Minimum area based on required parts plus one hex per required input/output atom.
 
     berlow wheel on tracks can expose the underlying hexes:
       - 0 track: 7+0, 2 track: 4+6, 3 track: 3+10
     """
-    needed = _needed_parts(pf, recipe)
+    if needed is None:
+        needed = _needed_parts(pf, recipe)
     use_metal_up = needed["metal_up_mandatory"]
     use_metal_down = needed["metal_down_mandatory"]
     metal_glyph_up, metal_glyph_down = _resolve_metal_glyphs(needed, True, True)
