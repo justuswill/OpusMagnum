@@ -1537,6 +1537,79 @@ def _has_tetra_shape(mols) -> bool:
     return False
 
 
+def _tetra_hub_forced_by_reagent(pf: PuzzleFile, needed: dict) -> bool:
+    """True if some output atom has exactly 3 bonds at 120° (the tetra
+    signature, see _has_tetra_shape) where two of those three bonds
+    already exist, pre-formed, in a single input reagent instance of the
+    hub's own atom type — e.g. P015-Stamina-Potion's water hub, whose
+    bonds to its two salts already exist in the "water bonded to two
+    salts" input piece. Since there's no unbonder here to ever split that
+    piece apart, those two bonds are unavoidably already present, and the
+    only choice left is when to add the third (fresh) bond. If the fresh
+    neighbor's atom type never appears bonded in *any* input reagent, nor
+    is reachable by an in-place transform (calcification/duplication/
+    rejection/projection — see _transform_source_types) from a type that
+    does — no bonded piece can ever provide it, so it can only arrive as a
+    bare single atom — then whichever moment that fresh bond is added, it
+    always turns a pre-existing 2-bond piece plus one bare atom into a
+    bare 4-atom tetra, regardless of build order. Unlike _has_tetra_shape,
+    this isn't restricted to a standalone 4-atom molecule — the hub can
+    sit inside a larger finished output (e.g. P015's 7-atom molecule),
+    since the forcing argument is about the single bond action, not the
+    shape's permanence.
+
+    A hub can have more than one input reagent providing a different
+    pre-bonded pair of its three edges (e.g. one reagent gives A-hub-B
+    with C only reachable bare, another gives B-hub-C with A also
+    reachable bonded elsewhere). Each such reagent is one *candidate*
+    build order for this hub; the hub is only actually forced if *every*
+    candidate's leftover (fresh) edge is bare-only. If even one candidate
+    leaves a fresh edge that could itself arrive already bonded to
+    something else, that candidate's completing bond isn't bare (it
+    brings extra baggage along), so that candidate escapes the tetra —
+    and since a solver can just choose that build order, the hub isn't
+    forced at all, regardless of how forcing the other candidates look."""
+    bonded_input_types = {a.type for mol in pf.inputs if len(mol.atoms) > 1 for a in mol.atoms}
+    needs_calc = needed["calcification"]
+    needs_dup = needed["baron_duplication"]
+    has_rejection = needed["metal_glyph_down"] is not None and "rejection" in needed["metal_glyph_down"]
+    has_projection = needed["metal_glyph_up"] is not None and "projection" in needed["metal_glyph_up"]
+    input_sigs = []
+    for in_mol in pf.inputs:
+        in_pos_to_type, in_slots = _position_bond_signatures(in_mol)
+        for in_pos, in_type in in_pos_to_type.items():
+            input_sigs.append((in_type, in_slots[in_pos]))
+
+    for out_mol in pf.outputs:
+        out_pos_to_type, out_slots = _position_bond_signatures(out_mol)
+        for pos, hub_type in out_pos_to_type.items():
+            sig = out_slots[pos]
+            filled = frozenset(i for i, slot in enumerate(sig) if slot is not None)
+            if filled not in ({0, 2, 4}, {1, 3, 5}):
+                continue
+            found_forcing = False
+            found_escape = False
+            for fresh in filled:
+                partial = [slot if i != fresh else None for i, slot in enumerate(sig)]
+                provided = any(
+                    in_type == hub_type and _bond_signature_compatible(partial, in_sig)
+                    for in_type, in_sig in input_sigs
+                )
+                if not provided:
+                    continue
+                leaf_type = sig[fresh][1]
+                if any(
+                    s in bonded_input_types
+                    for s in _transform_source_types(leaf_type, needs_calc, needs_dup, has_rejection, has_projection)
+                ):
+                    found_escape = True
+                else:
+                    found_forcing = True
+            if found_forcing and not found_escape:
+                return True
+    return False
+
+
 def _resolve_star_bond(pf: PuzzleFile, input_bond_sigs: dict, output_bond_sigs: dict,
                         needs_bonder: bool, needs_bonder_prisma: bool,
                         needs_unbonder: bool) -> tuple[bool, bool]:
@@ -1585,7 +1658,7 @@ def _resolve_star_bond(pf: PuzzleFile, input_bond_sigs: dict, output_bond_sigs: 
     return forward, reverse
 
 
-def _resolve_tetra_bond(pf: PuzzleFile, needs_bonder: bool, needs_bonder_prisma: bool,
+def _resolve_tetra_bond(pf: PuzzleFile, needed: dict, needs_bonder: bool, needs_bonder_prisma: bool,
                          needs_unbonder: bool) -> tuple[bool, bool]:
     """Bare 4-atom hub-and-3-leaves shape (see _has_tetra_shape), forward
     and reverse — mirrors _resolve_star_bond's two directions and
@@ -1604,8 +1677,10 @@ def _resolve_tetra_bond(pf: PuzzleFile, needs_bonder: bool, needs_bonder_prisma:
         and pf.conduit_capacities and max(pf.conduit_capacities) == 1
     )
     forward = (
-        _has_tetra_shape(pf.outputs)
-        and (built_from_singles or conduit_forces_singles)
+        (
+            (_has_tetra_shape(pf.outputs) and (built_from_singles or conduit_forces_singles))
+            or _tetra_hub_forced_by_reagent(pf, needed)
+        )
         and not needs_bonder_prisma
         and not needs_unbonder
     )
@@ -1616,6 +1691,42 @@ def _resolve_tetra_bond(pf: PuzzleFile, needs_bonder: bool, needs_bonder_prisma:
         and not needs_bonder_prisma
     )
     return forward, reverse
+
+
+def _needs_second_arm(pf: PuzzleFile, recipe: RecipeResult, needed: dict) -> bool:
+    """Whether the production layout can't be worked by a single arm in a
+    single chamber: either inputs/outputs are architecturally split
+    (is_isolated), or the working area (plus space taken up by any conduit
+    anchored in the biggest chamber, which the arm can't use) overflows the
+    biggest chamber."""
+    if not pf.is_production:
+        return False
+    if pf.is_isolated:
+        return True
+    assert len(pf.conduit_capacity_per_chamber) == len(pf.cabinet_sizes)
+    biggest_chamber_conduit_capacity = pf.conduit_capacity_per_chamber[
+        pf.cabinet_sizes.index(max(pf.cabinet_sizes))]
+    return (
+        area_lower_bound(pf, recipe, needed)[0] + biggest_chamber_conduit_capacity
+        > max(pf.cabinet_sizes)
+    )
+
+
+def _needs_piston_arm(pf: PuzzleFile, recipe: RecipeResult, needed: dict, tracks: int) -> bool:
+    """Whether the chamber has room for the puzzle's atoms/glyphs/conduits
+    alone, but not for that plus the track the arm needs to reach
+    everything — track is laid down as physical hexes, but (unlike area
+    itself) only ever needs 1 extra hex beyond the arm's own base position,
+    regardless of how many track segments get bought (see cost_lower_bound).
+    A piston arm covers that access without laying down any track hexes,
+    avoiding a full second arm."""
+    if not pf.is_production or pf.is_isolated:
+        return False
+    assert len(pf.conduit_capacity_per_chamber) == len(pf.cabinet_sizes)
+    biggest_chamber_conduit_capacity = pf.conduit_capacity_per_chamber[
+        pf.cabinet_sizes.index(max(pf.cabinet_sizes))]
+    base_area, note = area_lower_bound(pf, recipe, needed)
+    return base_area - (1 if 'access' in note else 0) + biggest_chamber_conduit_capacity + tracks > max(pf.cabinet_sizes)
 
 
 def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
@@ -1768,14 +1879,8 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
             needed["waste"] = not waste_type_avoidable()
         else:
             assert pf.cabinet_sizes
-            needs_second_arm = (
-                pf.is_isolated
-                or area_lower_bound(pf, recipe, needed)[0] > max(pf.cabinet_sizes)
-            )
+            needs_second_arm = _needs_second_arm(pf, recipe, needed)
             input_atoms = sum(pf.inputs[i].atom_count() for i in necessary_inputs(pf, recipe))
-            # At least one output molecule (the smallest one) also has to
-            # be assembled and held before it can be placed — reserve its
-            # footprint too, same generous-estimate spirit as input_atoms.
             smallest_output = min(
                 6 * (mol.atom_count() - 1) if any(a.type == ATOM_REPEAT for a in mol.atoms)
                 else mol.atom_count()
@@ -1891,7 +1996,7 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
         bonder_signal, needs_bonder_prisma, freespace_needs_unbonder,
     )
     needed["tetra_bond_forward"], needed["tetra_bond_reverse"] = _resolve_tetra_bond(
-        pf, bonder_signal, needs_bonder_prisma, freespace_needs_unbonder,
+        pf, needed, bonder_signal, needs_bonder_prisma, freespace_needs_unbonder,
     )
 
     return needed
@@ -2114,14 +2219,18 @@ def cost_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
         access, tracks, baseline_tracks, metal_glyph_up, metal_glyph_down, access_note, needs_bonder = _tracks_access(
             pf, recipe, needed, use_metal_up, use_metal_down)
 
-    needs_second_arm = (
-        pf.is_production
-        and (pf.is_isolated
-             or (pf.cabinet_sizes and area_lower_bound(pf, recipe, needed)[0] > max(pf.cabinet_sizes)))
-    )
+    needs_second_arm = _needs_second_arm(pf, recipe, needed)
+    uses_piston = False
     if needs_second_arm:
         g_lo = 40
         reasons = ["2×arm=40g"]
+    elif _needs_piston_arm(pf, recipe, needed, tracks):
+        uses_piston = True
+        g_lo = 40
+        reasons = ["1×piston-arm=40g"]
+        if "access" in area_lower_bound(pf, recipe, needed)[1]:
+            g_lo += 10
+            reasons.append("2×track=10g")
     else:
         g_lo = 20
         reasons = ["1×arm=20g"]
@@ -2170,12 +2279,12 @@ def cost_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
         reasons.append("1×unification=20g")
 
     note = " + ".join(reasons)
-    if tracks:
+    if tracks and not uses_piston:
         g_lo += tracks * 5
         if tracks > baseline_tracks:
-            reasons.append(f"{tracks}×track=5g (access={access}: {access_note})")
+            reasons.append(f"{tracks}×track={5*tracks}g (access={access}: {access_note})")
         else:
-            reasons.append(f"{tracks}×track=5g")
+            reasons.append(f"{tracks}×track={5*tracks}g")
         note = " + ".join(reasons)
 
     return g_lo, note

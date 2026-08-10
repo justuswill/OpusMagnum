@@ -87,6 +87,21 @@ CABINET_INSIDES_SIZE = {
     "Large": 37,
 }
 
+# Interior hex offsets of each named cabinet shape, relative to the
+# cabinet's stored position (omsim/decode.c cabinet_insides_*, transcribed
+# directly — these are irregular hand-drawn shapes, not a formula). Used to
+# resolve which cabinet a conduit's fixed puzzle-file anchor position
+# (starting_position_a/b) lands in, the same way the game's own
+# cabinet_for_position()/cabinet_map lookup does it.
+CABINET_INSIDES_OFFSETS = {
+    "Small": [(0, -1), (1, -1), (-1, 0), (0, 0), (1, 0), (-1, 1), (0, 1)],
+    "SmallWide": [(0, -1), (1, -1), (2, -1), (-1, 0), (0, 0), (1, 0), (2, 0), (-1, 1), (0, 1), (1, 1)],
+    "SmallWider": [(0, -1), (1, -1), (2, -1), (3, -1), (-1, 0), (0, 0), (1, 0), (2, 0), (3, 0), (-1, 1), (0, 1), (1, 1), (2, 1)],
+    "Medium": [(0, -2), (1, -2), (2, -2), (-1, -1), (0, -1), (1, -1), (2, -1), (-2, 0), (-1, 0), (0, 0), (1, 0), (2, 0), (-2, 1), (-1, 1), (0, 1), (1, 1), (-2, 2), (-1, 2), (0, 2)],
+    "MediumWide": [(0, -2), (1, -2), (2, -2), (3, -2), (-1, -1), (0, -1), (1, -1), (2, -1), (3, -1), (-2, 0), (-1, 0), (0, 0), (1, 0), (2, 0), (3, 0), (-2, 1), (-1, 1), (0, 1), (1, 1), (2, 1), (-2, 2), (-1, 2), (0, 2), (1, 2)],
+    "Large": [(0, -3), (1, -3), (2, -3), (3, -3), (-1, -2), (0, -2), (1, -2), (2, -2), (3, -2), (-2, -1), (-1, -1), (0, -1), (1, -1), (2, -1), (3, -1), (-3, 0), (-2, 0), (-1, 0), (0, 0), (1, 0), (2, 0), (3, 0), (-3, 1), (-2, 1), (-1, 1), (0, 1), (1, 1), (2, 1), (-3, 2), (-2, 2), (-1, 2), (0, 2), (1, 2), (-3, 3), (-2, 3), (-1, 3), (0, 3)],
+}
+
 
 @dataclass
 class Atom:
@@ -170,6 +185,14 @@ class PuzzleFile:
     # interior can't be built with one arm. Empty for non-production
     # puzzles. See CABINET_INSIDES_SIZE.
     cabinet_sizes: List[int] = field(default_factory=list)
+    # Total conduit capacity anchored in each cabinet, parallel to
+    # cabinet_sizes (same index order). A conduit's puzzle-file anchor
+    # positions (starting_position_a/b) are fixed hexes inside whichever
+    # cabinet they were placed in when the puzzle was authored; each side's
+    # capacity is credited to that cabinet. Two-sided conduits between the
+    # same pair of cabinets, or multiple conduits into one cabinet, sum.
+    # Empty for non-production puzzles or puzzles with no conduits.
+    conduit_capacity_per_chamber: List[int] = field(default_factory=list)
 
     def products_needed(self):
         return 6 * self.output_scale
@@ -313,8 +336,9 @@ class _Parser:
         is_isolated = False
         conduit_capacities: List[int] = []
         cabinet_sizes: List[int] = []
+        conduit_capacity_per_chamber: List[int] = []
         if is_production:
-            is_isolated, conduit_capacities, cabinet_sizes = self._production_info()
+            is_isolated, conduit_capacities, cabinet_sizes, conduit_capacity_per_chamber = self._production_info()
         if any(a.type == ATOM_REPEAT for mol in outputs for a in mol.atoms):
             # ATOM_REPEAT is a structural marker in the output, not a real
             # atom the puzzle file lists a reagent for — but schematic.py's
@@ -332,6 +356,7 @@ class _Parser:
             is_isolated=is_isolated,
             conduit_capacities=conduit_capacities,
             cabinet_sizes=cabinet_sizes,
+            conduit_capacity_per_chamber=conduit_capacity_per_chamber,
         )
 
     def _production_info(self):
@@ -346,28 +371,41 @@ class _Parser:
         _shrink_right = self.u8()
         is_isolated = bool(self.u8())
         cabinet_sizes = []
+        cabinet_hexes = []  # per-cabinet set of absolute (u, v) interior hexes
         for _ in range(self.u32()):  # cabinets: position (i8, i8) + type name
-            self.i8()
-            self.i8()
+            x = self.i8()
+            y = self.i8()
             cabinet_type = self.string()
             cabinet_sizes.append(CABINET_INSIDES_SIZE[cabinet_type])
+            cabinet_hexes.append({(x + du, y + dv) for du, dv in CABINET_INSIDES_OFFSETS[cabinet_type]})
         conduit_capacities = []
+        conduit_capacity_per_chamber = [0] * len(cabinet_sizes)
         for _ in range(self.u32()):  # conduits
-            self.i8()  # starting_position_a
-            self.i8()
-            self.i8()  # starting_position_b
-            self.i8()
+            ax, ay = self.i8(), self.i8()  # starting_position_a
+            bx, by = self.i8(), self.i8()  # starting_position_b
             n_hexes = self.u32()
             for _ in range(n_hexes):
                 self.i8()
                 self.i8()
             conduit_capacities.append(n_hexes)
+            # Each anchor is a fixed hex from puzzle authoring, always
+            # inside exactly one cabinet — same lookup as the game's own
+            # cabinet_for_position() (omsim/decode.c/sim.c), just done here
+            # against the puzzle-file cabinet shapes instead of a solution's
+            # rasterized cabinet_map.
+            chambers = set()
+            for pos in ((ax, ay), (bx, by)):
+                matches = [i for i, hexes in enumerate(cabinet_hexes) if pos in hexes]
+                assert len(matches) == 1, (pos, matches)
+                chambers.add(matches[0])
+            for idx in chambers:
+                conduit_capacity_per_chamber[idx] += n_hexes
         for _ in range(self.u32()):  # vials: position (i8, i8) + style (u8) + count (u32)
             self.i8()
             self.i8()
             self.u8()
             self.u32()
-        return is_isolated, conduit_capacities, cabinet_sizes
+        return is_isolated, conduit_capacities, cabinet_sizes, conduit_capacity_per_chamber
 
 
 def parse_puzzle(path: str) -> PuzzleFile:
