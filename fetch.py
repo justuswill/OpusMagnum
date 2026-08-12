@@ -5,8 +5,10 @@ DRM, and community — plus top leaderboard solutions for the key metric categor
 
 For normal/polymer puzzles: GX (min cost>cycles·area), AX (min area>cost·cycles),
                             CX (min cycles>cost·area), SUM (min g+c+a),
-                            GC (min cost, cycles as tiebreak)
-For production puzzles:     GX_P, CX_P, SUM_P, IX_P (instructions)
+                            GC (min cost, cycles as tiebreak),
+                            GI (min cost, instructions as tiebreak)
+For production puzzles:     GX_P, CX_P, SUM_P, IX_P (instructions), GC_P (cost, cycles as tiebreak),
+                            GI_P (cost, instructions as tiebreak)
 
 Puzzle files come from the leaderboard's /om/puzzle/{id}/file endpoint.
 Solutions come from /om/puzzle/{id}/records and follow the redirect to GitHub.
@@ -26,8 +28,8 @@ BASE_URL = "https://zlbb.faendir.com"
 PUZZLES_DIR = os.path.join(os.path.dirname(__file__), "puzzles")
 
 # Categories to collect per puzzle type
-NORMAL_CATS   = {"GX", "AX", "CX", "SUM", "GC"}
-PRODUCTION_CATS = {"GX_P", "CX_P", "SUM_P", "IX_P"}
+NORMAL_CATS   = {"GX", "AX", "CX", "SUM", "GC", "GI"}
+PRODUCTION_CATS = {"GX_P", "CX_P", "SUM_P", "IX_P", "GC_P", "GI_P"}
 PRODUCTION_TYPES = {"PRODUCTION"}
 
 

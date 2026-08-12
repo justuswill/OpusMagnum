@@ -1559,16 +1559,21 @@ def _tetra_hub_forced_by_reagent(pf: PuzzleFile, needed: dict) -> bool:
     shape's permanence.
 
     A hub can have more than one input reagent providing a different
-    pre-bonded pair of its three edges (e.g. one reagent gives A-hub-B
+    pre-bonded piece of its three edges (e.g. one reagent gives A-hub-B
     with C only reachable bare, another gives B-hub-C with A also
-    reachable bonded elsewhere). Each such reagent is one *candidate*
-    build order for this hub; the hub is only actually forced if *every*
-    candidate's leftover (fresh) edge is bare-only. If even one candidate
-    leaves a fresh edge that could itself arrive already bonded to
-    something else, that candidate's completing bond isn't bare (it
-    brings extra baggage along), so that candidate escapes the tetra —
-    and since a solver can just choose that build order, the hub isn't
-    forced at all, regardless of how forcing the other candidates look."""
+    reachable bonded elsewhere) — or a reagent providing just *one* edge
+    (e.g. hub-A alone), leaving two fresh edges rather than one. Each such
+    reagent is one *candidate* build order for this hub; a candidate is
+    forcing only if *every* one of its fresh (not-yet-provided) edges is
+    bare-only — with two fresh edges, whichever of the two is added last
+    still completes a bare tetra, so both must be inescapable, not just
+    one. The hub is only actually forced if *every* candidate across every
+    reagent is forcing. If even one candidate has a fresh edge that could
+    itself arrive already bonded to something else, that edge can simply
+    be added last, bringing extra baggage along so the completing bond
+    isn't bare — that candidate escapes the tetra, and since a solver can
+    just choose that build order, the hub isn't forced at all, regardless
+    of how forcing the other candidates look."""
     bonded_input_types = {a.type for mol in pf.inputs if len(mol.atoms) > 1 for a in mol.atoms}
     needs_calc = needed["calcification"]
     needs_dup = needed["baron_duplication"]
@@ -1580,6 +1585,12 @@ def _tetra_hub_forced_by_reagent(pf: PuzzleFile, needed: dict) -> bool:
         for in_pos, in_type in in_pos_to_type.items():
             input_sigs.append((in_type, in_slots[in_pos]))
 
+    def leaf_escapes(leaf_type: int) -> bool:
+        return any(
+            s in bonded_input_types
+            for s in _transform_source_types(leaf_type, needs_calc, needs_dup, has_rejection, has_projection)
+        )
+
     for out_mol in pf.outputs:
         out_pos_to_type, out_slots = _position_bond_signatures(out_mol)
         for pos, hub_type in out_pos_to_type.items():
@@ -1589,22 +1600,22 @@ def _tetra_hub_forced_by_reagent(pf: PuzzleFile, needed: dict) -> bool:
                 continue
             found_forcing = False
             found_escape = False
-            for fresh in filled:
-                partial = [slot if i != fresh else None for i, slot in enumerate(sig)]
-                provided = any(
-                    in_type == hub_type and _bond_signature_compatible(partial, in_sig)
-                    for in_type, in_sig in input_sigs
-                )
-                if not provided:
-                    continue
-                leaf_type = sig[fresh][1]
-                if any(
-                    s in bonded_input_types
-                    for s in _transform_source_types(leaf_type, needs_calc, needs_dup, has_rejection, has_projection)
-                ):
-                    found_escape = True
-                else:
-                    found_forcing = True
+            for provided_size in (1, 2):
+                for provided in itertools.combinations(filled, provided_size):
+                    partial = [slot if i in provided else None for i, slot in enumerate(sig)]
+                    reagent_provides = any(
+                        in_type == hub_type
+                        and sum(1 for s in in_sig if s is not None) == provided_size
+                        and _bond_signature_compatible(partial, in_sig)
+                        for in_type, in_sig in input_sigs
+                    )
+                    if not reagent_provides:
+                        continue
+                    fresh = filled - set(provided)
+                    if any(leaf_escapes(sig[f][1]) for f in fresh):
+                        found_escape = True
+                    else:
+                        found_forcing = True
             if found_forcing and not found_escape:
                 return True
     return False
