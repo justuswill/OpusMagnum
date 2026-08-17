@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 solve_analysis.py — compute lower/upper bounds for the metrics of the optimal SUM solution.
 
@@ -20,10 +19,9 @@ import os
 import re
 import subprocess
 
-from puzzle_parser import parse_puzzle, ATOM_NAMES
+from puzzle_parser import parse_puzzle
 from bounds import cycles_lower_bound, cost_lower_bound, area_lower_bound, cycles_lower_bound_for_budget
-from stoichiometry import solve_recipe, solve_recipe_combined, solve_recipe_cheap, describe_molecule
-from schematic_parallel import reachable_states
+from stoichiometry import solve_recipe_fast, print_recipe
 
 PUZZLES_DIR = os.path.join(os.path.dirname(__file__), "puzzles")
 OMSIM_BIN   = os.path.join(os.path.dirname(__file__), "omsim", "omsim")
@@ -115,30 +113,6 @@ def verify_all_solutions(folder, puzzle_file, scores, files):
                 scores[cat][score_key] = act
 
 
-def print_recipe(pf, result):
-    print("Recipe (stoichiometry):")
-    if result.status != "Optimal":
-        print(f"  {result.status} — no atom-balanced recipe found")
-        return
-    for i, mol in enumerate(pf.inputs):
-        count = result.reagent_counts.get(i, 0)
-        if count:
-            group_size = result.reagent_group_size.get(i, 1)
-            suffix = f"[x{group_size}]" if group_size > 1 else ""
-            print(f"  {count:>4}x  input {i}{suffix}: {describe_molecule(mol)}")
-    products_needed = pf.products_needed()
-    for i, mol in enumerate(pf.outputs):
-        print(f"  {products_needed:>4}x  output {i}: {describe_molecule(mol)}")
-    if result.reaction_counts:
-        print("  Transformations:")
-        for name, count in sorted(result.reaction_counts.items()):
-            print(f"  {count:>4}x  {name}")
-    if result.waste:
-        print("  Waste (surplus atoms produced beyond what's needed):")
-        for atype, count in sorted(result.waste.items()):
-            print(f"  {count:>4}x  {ATOM_NAMES.get(atype, atype)}")
-
-
 def main(args):
     pid = args.puzzle.strip()
     folder, collection = find_puzzle_dir(pid)
@@ -164,26 +138,20 @@ def main(args):
     print(f"Type      : {'PRODUCTION' if is_prod else 'NORMAL'}")
     print()
 
-    try:
-        recipe = solve_recipe_combined(pf)
-        recipe_cheap = solve_recipe_cheap(pf)
-    except NotImplementedError:
-        recipe = recipe_cheap = solve_recipe(pf)
-    print_recipe(pf, recipe)
+    recipes = solve_recipe_fast(pf)
+    print_recipe(*recipes[0])
     print()
 
     # ── Analytic lower bounds ─────────────────────────────────────────────
 
-    g_lo, g_note = cost_lower_bound(pf, recipe_cheap)
+    g_lo, g_note = cost_lower_bound(pf)
     if not is_prod:
-        t_lo, t_note = area_lower_bound(pf, recipe_cheap)
+        t_lo, t_note = area_lower_bound(pf)
     else:
         t_lo, t_note = 1, "trivial (≥1 instruction)"
-    print('hi')
-    states = reachable_states(pf, recipe, workers=args.workers, batch_size=args.batch_size)
+    pf, recipe, states, c_lo, c_note = cycles_lower_bound(recipes, workers=args.workers, batch_size=args.batch_size)
     # print(states)
     # print()
-    c_lo, c_note = cycles_lower_bound(pf, recipe, states, workers=args.workers, batch_size=args.batch_size)
 
     # ── Lower bounds + individual records table ───────────────────────────
 
@@ -256,44 +224,13 @@ def main(args):
     print(f"  {t_label:<18}: {format_bound(t_lo, t_hi)}")
 
 
-def _chapter_1_2_pids():
-    """Campaign chapters 1+2, in actual in-game mission order (not numeric ID order)."""
-    return [
-        "P007",  # Stabilized Water
-        "P010",  # Refined Gold
-        "P009",  # Face Powder
-        "P011",  # Waterproof Sealant
-        "P013",  # Hangover Cure
-        "P008",  # Airship Fuel
-        "P012",  # Precision Machine Oil
-        "P014",  # Health Tonic
-        "P015",  # Stamina Potion
-        "P016",  # Hair Product
-        "P019",  # Rocket Propellant
-        "P018",  # Mist of Incapacitation
-        "P017",  # Explosive Phial
-        "P020",  # Armor Filament
-        "P021",  # Courage Potion
-        "P022",  # Surrender Flare
-    ]
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compute proven bounds for the optimal SUM solution.")
-    parser.add_argument("--puzzle", default='P009', metavar="ID", help="Puzzle ID")
+    parser.add_argument("--puzzle", default='P095', metavar="ID", help="Puzzle ID")
     parser.add_argument("--workers", type=int, default=None,
                          help="Worker process count for the state-space search "
                               "(default: os.process_cpu_count())")
     parser.add_argument("--batch-size", type=int, default=8,
                          help="States per worker task (default: 8)")
     args = parser.parse_args()
-
-    if args.puzzle is None:
-        for pid in _chapter_1_2_pids():
-            try:
-                main(argparse.Namespace(puzzle=pid, workers=args.workers, batch_size=args.batch_size))
-            except Exception as e:
-                print(f"Puzzle    : {pid} — skipped ({type(e).__name__}: {e})")
-            print()
-    else:
-        main(args)
+    main(args)

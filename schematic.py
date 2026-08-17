@@ -140,27 +140,30 @@ class StateGraph:
 
 def _unit_scale(recipe: RecipeResult, products_needed: int) -> int:
     """Largest divisor of products_needed that also divides every nonzero
-    reagent_counts/reaction_counts value — the real "one unit" size when
+    reagent_counts/reaction_counts value (its max — the count any caller
+    not showing the range uses) — the real "one unit" size when
     products_needed doesn't split those evenly (P031b: reagent_counts=
-    {0: 6}, products_needed=18 -- 6/18 isn't an integer, but gcd(18, 6)=6
-    is, giving 3 output instances per unit instead of the naive 1)."""
+    {0: (6, 6)}, products_needed=18 -- 6/18 isn't an integer, but
+    gcd(18, 6)=6 is, giving 3 output instances per unit instead of the
+    naive 1)."""
     g = products_needed
-    for v in recipe.reagent_counts.values():
-        if v > 0:
-            g = math.gcd(g, v)
-    for v in recipe.reaction_counts.values():
-        if v > 0:
-            g = math.gcd(g, v)
+    for _lo, hi in recipe.reagent_counts.values():
+        if hi > 0:
+            g = math.gcd(g, hi)
+    for _lo, hi in recipe.reaction_counts.values():
+        if hi > 0:
+            g = math.gcd(g, hi)
     return g
 
 
 def _reaction_unit_counts(recipe: RecipeResult, unit_scale: int) -> Dict[str, int]:
-    """Per-unit reaction budget: the whole-run recipe.reaction_counts divided
-    by unit_scale (_unit_scale). Shared by initial_state (output-side seed)
-    and _seed_input_states (input-side seed) so both directions start from
-    exactly the same budget — required for a forward and backward search
-    to ever meet at a matching _state_signature."""
-    return {n: c // unit_scale for n, c in recipe.reaction_counts.items() if c > 0}
+    """Per-unit reaction budget: the whole-run recipe.reaction_counts's max
+    divided by unit_scale (_unit_scale). Shared by initial_state
+    (output-side seed) and _seed_input_states (input-side seed) so both
+    directions start from exactly the same budget — required for a
+    forward and backward search to ever meet at a matching
+    _state_signature."""
+    return {r.name: hi // unit_scale for r, (_lo, hi) in recipe.reaction_counts.items() if hi > 0}
 
 
 def initial_state(pf: PuzzleFile, recipe: RecipeResult) -> State:
@@ -176,9 +179,9 @@ def initial_state(pf: PuzzleFile, recipe: RecipeResult) -> State:
     reaction_unit_counts = _reaction_unit_counts(recipe, g)
     molecules = [Molecule(atoms=list(mol.atoms), bonds=list(mol.bonds))
                  for mol in pf.outputs for _ in range(batch)]
-    for atype, w in recipe.waste.items():
+    for atype, (_lo, hi) in recipe.waste.items():
         molecules.extend(Molecule(atoms=[Atom(type=atype, u=0, v=0)], bonds=[])
-                          for _ in range(w // g))
+                          for _ in range(hi // g))
     return State(molecules, reaction_unit_counts)
 
 
@@ -192,10 +195,10 @@ def _seed_input_states(pf: PuzzleFile, recipe: RecipeResult, products_needed: in
     instead of pf.outputs/reaction_counts. Yields the baseline composition
     (matching recipe.reagent_counts exactly, one unit copy each) first, then
     — only for recipes with a flexible calcify_X_or_Y group
-    (recipe.extra_reactions, see solve_recipe_combined) — every other valid
+    (recipe.extra_reactions, see solve_recipe_fast) — every other valid
     way to split that group's shared total among its alternative types, up
     to _MAX_SEED_ALTERNATES: recipe.reagent_counts already encodes ONE such
-    split (solve_recipe_combined's own proportional rebalance), which may
+    split (solve_recipe_fast's own proportional rebalance), which may
     not be the one any state in the backward graph actually realizes — same
     reason _matches_raw_reagents' exact=False fallback exists, just applied
     on the input side instead of the output side. Every yielded molecule of
@@ -209,6 +212,12 @@ def _seed_input_states(pf: PuzzleFile, recipe: RecipeResult, products_needed: in
     alone)."""
     g = _unit_scale(recipe, products_needed)
     reaction_unit_counts = _reaction_unit_counts(recipe, g)
+    # Every consumer here just wants "how many of this reagent" — the
+    # min/max distinction reagent_counts carries is for range display and
+    # <=-vs-== matching elsewhere (see reachable_states), not state
+    # construction, so extract the max (the count a range's own ceiling
+    # collapses to when there's no range) once up front.
+    baseline_counts = {i: hi for i, (_lo, hi) in recipe.reagent_counts.items()}
 
     def make_state(counts: Dict[int, int]) -> State:
         molecules = []
@@ -223,13 +232,15 @@ def _seed_input_states(pf: PuzzleFile, recipe: RecipeResult, products_needed: in
                 molecules.append(Molecule(atoms=atoms, bonds=list(src.bonds)))
         return State(molecules, dict(reaction_unit_counts))
 
-    yield make_state(recipe.reagent_counts)
+    yield make_state(baseline_counts)
 
     yielded = 1
-    for name, r in recipe.extra_reactions.items():
-        if yielded >= _MAX_SEED_ALTERNATES or not r.alt_reagent:
+    for r in recipe.reaction_counts:
+        if r.alternatives is None:
             continue
-        types = r.alt_reagent
+        types = _single_atom_alt_types(r)
+        if yielded >= _MAX_SEED_ALTERNATES or not types:
+            continue
         member_indices = [
             i for i, mol in enumerate(pf.inputs)
             if i in recipe.reagent_counts
@@ -243,10 +254,10 @@ def _seed_input_states(pf: PuzzleFile, recipe: RecipeResult, products_needed: in
         # rest of each member's current reagent_counts is fixed direct-use
         # (bonded into the output as-is, never calcified) and must stay put.
         # direct_use[i] = recipe.reagent_counts[i] minus whatever share of
-        # `total` solve_recipe_combined's own proportional split assigned it
+        # `total` solve_recipe_fast's own proportional split assigned it
         # — reconstructed from the same repeats-weighted apportionment it
         # uses, so this stays in sync without importing its internals.
-        total = recipe.reaction_counts.get(name, 0) // g
+        total = recipe.reaction_counts.get(r, (0, 0))[1] // g
         repeats = {i: recipe.reagent_group_size.get(i, 1) for i in member_indices}
         total_repeats = sum(repeats.values()) or 1
         base_guess = {i: (total * repeats[i]) // total_repeats for i in member_indices}
@@ -254,7 +265,7 @@ def _seed_input_states(pf: PuzzleFile, recipe: RecipeResult, products_needed: in
         by_remainder = sorted(member_indices, key=lambda i: (total * repeats[i]) % total_repeats, reverse=True)
         for i in by_remainder[:max(remainder, 0)]:
             base_guess[i] += 1
-        direct_use = {i: recipe.reagent_counts[i] - base_guess[i] for i in member_indices}
+        direct_use = {i: baseline_counts[i] - base_guess[i] for i in member_indices}
 
         def compositions(total, n):
             if n == 1:
@@ -267,10 +278,10 @@ def _seed_input_states(pf: PuzzleFile, recipe: RecipeResult, products_needed: in
         for split in compositions(total, len(member_indices)):
             if yielded >= _MAX_SEED_ALTERNATES:
                 break
-            counts = dict(recipe.reagent_counts)
+            counts = dict(baseline_counts)
             for i, s in zip(member_indices, split):
                 counts[i] = direct_use[i] + s
-            if counts == recipe.reagent_counts:
+            if counts == baseline_counts:
                 continue  # already yielded as the baseline
             yield make_state(counts)
             yielded += 1
@@ -898,6 +909,35 @@ def _combined_bond_neighbors(state: State, parts_available: int) -> List[Tuple[S
     return neighbors_out
 
 
+def _single_atom_alt_types(r: Reaction) -> Optional[List[int]]:
+    """Alternative single reagent atom types, if every one of r's
+    alternatives (see stoichiometry.Reaction.alternatives) is a pure
+    single-atom substitution — consumes exactly one atom of its own type
+    and nothing else, with r.delta itself carrying no consumed side of its
+    own (only whatever's shared, e.g. calcify_water_or_fire's {SALT: +1}).
+    None for a non-combined reaction, or a differently-shaped combo (e.g.
+    a future purify_X_to_Y_or_reject_Z_to_Y, whose alternatives consume
+    more than one atom and/or produce a bystander byproduct) — a
+    structural check, not a name-based one, so it keeps recognizing
+    calcify_X_or_Y correctly once other combo shapes exist alongside it.
+    Callers that model flexibility as "which raw reagent molecule gets
+    grabbed" (seeding alternate starting states, reagent-count
+    bookkeeping) only make sense for this specific shape — a combo whose
+    alternatives fire different real reactions using already-existing
+    atoms, not raw reagents, needs a different mechanism entirely."""
+    if not r.alternatives or any(d < 0 for d in r.delta.values()):
+        return None
+    types = []
+    for _name, extra in r.alternatives:
+        if len(extra) != 1:
+            return None
+        (t, c), = extra.items()
+        if c != -1:
+            return None
+        types.append(t)
+    return types
+
+
 def _reverse_reaction_atoms(r: Reaction) -> Tuple[List[int], List[int]]:
     """(types to remove [product side], types to add [reagent side]) — one
     entry per atom instance, for reversing a single firing of r."""
@@ -910,20 +950,42 @@ def _reverse_reaction_atoms(r: Reaction) -> Tuple[List[int], List[int]]:
     return remove_types, add_types
 
 
-def _reverse_reaction_options(r: Reaction) -> Tuple[List[int], List[List[int]]]:
-    """(remove_types, add_type_options) — like _reverse_reaction_atoms, but
-    add_type_options is a list of alternatives for what the relabeled first
-    atom can become. Normally just one option (the reaction's own fixed
-    delta, unchanged from _reverse_reaction_atoms); a combined
-    "calcify_X_or_Y" synthetic reaction (r.alt_reagent set — see
-    stoichiometry.solve_recipe_combined) has no single fixed reagent-side
-    atom, so one option per alternative type, all sharing the same
-    reaction's budget — the caller tries each as a separate candidate
-    move."""
-    remove_types, add_types = _reverse_reaction_atoms(r)
-    if not r.alt_reagent:
-        return remove_types, [add_types]
-    return remove_types, [[alt] for alt in r.alt_reagent]
+def _reverse_reaction_options(r: Reaction) -> List[Tuple[str, List[int], List[int]]]:
+    """(alt_name, remove_types, add_types) triples — like
+    _reverse_reaction_atoms, but one option per alternative instead of one
+    fixed (remove_types, add_types). Normally just one option (r's own name
+    and fixed delta, unchanged from _reverse_reaction_atoms); a combined
+    synthetic reaction (r.alternatives set — see stoichiometry.Reaction /
+    solve_recipe_fast) has no single fixed result, so one option per
+    alternative, all sharing the same combined reaction's budget — the
+    caller tries each as a separate candidate move. Each alternative's full
+    delta is r.delta merged with its own extra delta (Reaction.alternatives),
+    so BOTH remove_types (product side) and add_types (reagent side) can
+    vary per alternative, not just add_types — needed since a combo's
+    members don't always even agree on what they produce (e.g. a
+    purify_X_to_Y_or_reject_Z_to_Y combo: reject also makes a bystander
+    quicksilver product purify doesn't). Each option keeps its own real
+    member-reaction name (never the umbrella combined name) precisely so a
+    caller can ask "is *this specific alternative* drop-and-create" rather
+    than needing one answer for the whole group — calcify_X_or_Y's members
+    always agree (none are), but project_X_to_Y_or_purify_X_to_Y's don't
+    (only purification is)."""
+    if not r.alternatives:
+        remove_types, add_types = _reverse_reaction_atoms(r)
+        return [(r.name, remove_types, add_types)]
+    options = []
+    for alt_name, extra in r.alternatives:
+        full_delta = dict(r.delta)
+        for atype, d in extra.items():
+            full_delta[atype] = full_delta.get(atype, 0) + d
+        remove_types, add_types = [], []
+        for atype, d in full_delta.items():
+            if d > 0:
+                remove_types.extend([atype] * d)
+            elif d < 0:
+                add_types.extend([atype] * (-d))
+        options.append((alt_name, remove_types, add_types))
+    return options
 
 
 def _elementary_actions_for_name(state: State, reactions: Dict[str, Reaction], name: str) -> List[ReactionAction]:
@@ -939,16 +1001,18 @@ def _elementary_actions_for_name(state: State, reactions: Dict[str, Reaction], n
     state conflict with one of those."""
     actions = []
     r = reactions[name]
-    remove_types, add_type_options = _reverse_reaction_options(r)
-    for add_types in add_type_options:
-        # A combined "X_or_Y" reaction's move label should show which
-        # concrete alternative this action actually used, not the umbrella
-        # group name.
-        display_name = f"calcify_{ATOM_NAMES[add_types[0]]}" if r.alt_reagent else name
+    options = _reverse_reaction_options(r)
+    for alt_name, remove_types, add_types in options:
+        # A combined reaction's move label shows which concrete alternative
+        # this action actually used, not the umbrella group name — and
+        # _firing_atoms_ok is checked against that same alternative's real
+        # name, not the umbrella one, since a combined group's members can
+        # disagree on whether they're drop-and-create (project_X_to_Y isn't,
+        # purify_X_to_Y is — see _reverse_reaction_options).
         for chosen in _choose_instances(state, remove_types):
-            if not _firing_atoms_ok(state, name, chosen):
+            if not _firing_atoms_ok(state, alt_name, chosen):
                 continue
-            actions.append(ReactionAction(display_name, frozenset(chosen), name, chosen, add_types))
+            actions.append(ReactionAction(alt_name, frozenset(chosen), name, chosen, add_types))
     return actions
 
 
@@ -965,8 +1029,7 @@ def _elementary_reaction_actions(state: State, reactions: Dict[str, Reaction]) -
     for name, budget in state.reactions_left.items():
         if budget <= 0:
             continue
-        remove_types, _add_type_options = _reverse_reaction_options(reactions[name])
-        if len(remove_types) == 1 and not _is_space_limited(name):
+        if _reaction_pool_key(state, reactions, name) is not None:
             continue  # handled by _combined_bond_reaction_neighbors' catalogs instead
         actions.extend(_elementary_actions_for_name(state, reactions, name))
     return actions
@@ -1050,21 +1113,43 @@ def _apply_mixed_actions(state: State, chosen: List[Action]) -> State:
 
 
 def _reaction_pool_key(state: State, reactions: Dict[str, Reaction], name: str):
-    """(atype, add_type_options) if `name`'s single-atom reversal actions
-    are poolable — safe to enumerate by *how many* (and *which kind of*)
-    fire rather than materializing "which literal atom" per action first
-    (see _atype_reaction_catalog) — else None. Requires group_size 1 (a
-    lone atom in, no co-reagents to pair up) and not space-limited
-    (projection still needs its own free-hex bookkeeping per firing, so
-    stays in the exact/individual path)."""
+    """(atype, alt_options) if `name`'s single-atom reversal actions are
+    poolable — safe to enumerate by *how many* (and *which kind of*) fire
+    rather than materializing "which literal atom" per action first (see
+    _atype_reaction_catalog) — else None. alt_options is a list of
+    (alt_name, add_types) — every alternative's own real name (never a
+    synthesized one), carried through so callers can use it directly as a
+    fired action's display name instead of guessing it back from add_types
+    (that guess only ever worked for calcify_X_or_Y, whose alternatives
+    happen to be named f"calcify_{atom}" — it wouldn't generalize to
+    other combo shapes).
+
+    Requires group_size 1 (a lone atom in, no co-reagents to pair up), not
+    space-limited (projection still needs its own free-hex bookkeeping per
+    firing, so stays in the exact/individual path), every alternative
+    sharing the exact same single-atom remove_types, AND every alternative
+    agreeing on drop-and-create-ness — the pooling machinery below filters
+    candidate atoms once per atype (see pool_names_by_type's is_dc), not
+    per alternative, so a combined reaction whose own alternatives
+    disagree internally (impossible for calcify_X_or_Y's members, which
+    always agree; possible in principle for a future combo mixing e.g. a
+    relabeling alternative with a drop-and-create one) can't be pooled
+    uniformly and falls back to the exact/individual path instead — this
+    is the single source of truth other poolability checks (e.g.
+    _elementary_reaction_actions) defer to, rather than re-deriving it."""
     r = reactions[name]
-    remove_types, add_type_options = _reverse_reaction_options(r)
-    if len(remove_types) != 1 or _is_space_limited(name):
+    options = _reverse_reaction_options(r)
+    remove_type_sets = {tuple(remove_types) for _alt_name, remove_types, _add_types in options}
+    dc_flags = {_is_drop_and_create(alt_name) for alt_name, _remove_types, _add_types in options}
+    if len(remove_type_sets) != 1 or len(dc_flags) != 1 or _is_space_limited(name):
         return None
-    return remove_types[0], add_type_options
+    (remove_types,) = remove_type_sets
+    if len(remove_types) != 1:
+        return None
+    return remove_types[0], [(alt_name, add_types) for alt_name, _remove_types, add_types in options]
 
 
-def _free_source_allocations(reactions: Dict[str, Reaction], candidates: List[Tuple[int, int]],
+def _free_source_allocations(candidates: List[Tuple[int, int]],
                               name_group: list, remaining_budget: Dict[str, int]):
     """Every joint way to split however many of `candidates` (0..len, all
     free-standing atoms of one shared type) go to each (name, alternative)
@@ -1095,32 +1180,30 @@ def _free_source_allocations(reactions: Dict[str, Reaction], candidates: List[Tu
         if i == len(name_group):
             yield [], {}
             return
-        name, add_type_options = name_group[i]
+        name, alt_options = name_group[i]
         cap = min(remaining_budget.get(name, 0), remaining)
         for t in range(cap + 1):
-            for split in alt_splits(t, len(add_type_options)):
+            for split in alt_splits(t, len(alt_options)):
                 for rest_alloc, rest_used in rec(i + 1, remaining - t):
                     used = dict(rest_used)
                     if t:
                         used[name] = used.get(name, 0) + t
-                    yield [(name, add_type_options, split)] + rest_alloc, used
+                    yield [(name, alt_options, split)] + rest_alloc, used
 
     for allocation, used in rec(0, M):
         offset = 0
         bundle = []
-        for name, add_type_options, split in allocation:
-            r = reactions[name]
-            for add_types, k in zip(add_type_options, split):
-                display_name = f"calcify_{ATOM_NAMES[add_types[0]]}" if r.alt_reagent else name
+        for name, alt_options, split in allocation:
+            for (alt_name, add_types), k in zip(alt_options, split):
                 for _ in range(k):
                     mi, ai = candidates[offset]
                     offset += 1
                     firing = [(mi, ai)]
-                    bundle.append(ReactionAction(display_name, frozenset(firing), name, firing, add_types))
+                    bundle.append(ReactionAction(alt_name, frozenset(firing), name, firing, add_types))
         yield bundle, used
 
 
-def _orbit_source_allocations(reactions: Dict[str, Reaction], mi: int, orbit: List[int],
+def _orbit_source_allocations(mi: int, orbit: List[int],
                                perms: List[Dict[int, int]], name_group: list,
                                remaining_budget: Dict[str, int]):
     """Every canonical coloring of `orbit`'s atoms (all bonded inside
@@ -1157,8 +1240,8 @@ def _orbit_source_allocations(reactions: Dict[str, Reaction], mi: int, orbit: Li
 
     # symbol 0 = unfired; symbols 1.. = one per (name index, alternative index)
     alphabet: List[Tuple[Optional[int], Optional[int]]] = [(None, None)]
-    for ni, (_name, add_type_options) in enumerate(name_group):
-        for alt_idx in range(len(add_type_options)):
+    for ni, (_name, alt_options) in enumerate(name_group):
+        for alt_idx in range(len(alt_options)):
             alphabet.append((ni, alt_idx))
     n_symbols = len(alphabet)
 
@@ -1194,18 +1277,16 @@ def _orbit_source_allocations(reactions: Dict[str, Reaction], mi: int, orbit: Li
             ni, alt_idx = alphabet[c]
             if ni is None:
                 continue
-            name, add_type_options = name_group[ni]
-            add_types = add_type_options[alt_idx]
-            r = reactions[name]
-            display_name = f"calcify_{ATOM_NAMES[add_types[0]]}" if r.alt_reagent else name
+            name, alt_options = name_group[ni]
+            alt_name, add_types = alt_options[alt_idx]
             ai = orbit[pos]
             firing = [(mi, ai)]
-            bundle.append(ReactionAction(display_name, frozenset(firing), name, firing, add_types))
+            bundle.append(ReactionAction(alt_name, frozenset(firing), name, firing, add_types))
             used[name] = used.get(name, 0) + 1
         yield bundle, used
 
 
-def _atype_reaction_catalog(state: State, reactions: Dict[str, Reaction], name_group: list, sources: list):
+def _atype_reaction_catalog(state: State, name_group: list, sources: list):
     """Every joint allocation across ALL of a shared atom type's candidate
     `sources` (each ("free", candidates) or ("orbit", mi, orbit, perms) —
     see _free_source_allocations / _orbit_source_allocations) for every
@@ -1217,7 +1298,7 @@ def _atype_reaction_catalog(state: State, reactions: Dict[str, Reaction], name_g
     next source sees, so e.g. a name with both free-standing and
     orbit-bonded candidates this state can draw from both without
     over-firing."""
-    budgets = {name: state.reactions_left.get(name, 0) for name, _add_type_options in name_group}
+    budgets = {name: state.reactions_left.get(name, 0) for name, _alt_options in name_group}
 
     def rec(idx, remaining_budget):
         if idx == len(sources):
@@ -1225,10 +1306,10 @@ def _atype_reaction_catalog(state: State, reactions: Dict[str, Reaction], name_g
             return
         source = sources[idx]
         if source[0] == "free":
-            gen = _free_source_allocations(reactions, source[1], name_group, remaining_budget)
+            gen = _free_source_allocations(source[1], name_group, remaining_budget)
         else:
             _kind, mi, orbit, perms = source
-            gen = _orbit_source_allocations(reactions, mi, orbit, perms, name_group, remaining_budget)
+            gen = _orbit_source_allocations(mi, orbit, perms, name_group, remaining_budget)
         for bundle, used in gen:
             next_remaining = dict(remaining_budget)
             for name, u in used.items():
@@ -1290,8 +1371,11 @@ def _combined_bond_reaction_neighbors(state: State, parts_available: int,
         key = _reaction_pool_key(state, reactions, name)
         if key is None:
             continue
-        atype, add_type_options = key
-        pool_names_by_type.setdefault(atype, []).append((name, add_type_options, _is_drop_and_create(name)))
+        atype, alt_options = key
+        # _reaction_pool_key already required every alternative to agree on
+        # drop-and-create-ness, so any one of them gives the right answer.
+        is_dc = _is_drop_and_create(alt_options[0][0])
+        pool_names_by_type.setdefault(atype, []).append((name, alt_options, is_dc))
 
     pool_catalogs = []
     molecule_orbits_cache: Dict[int, tuple] = {}
@@ -1310,7 +1394,7 @@ def _combined_bond_reaction_neighbors(state: State, parts_available: int,
             continue
 
         is_dc = dc_flags.pop()
-        name_group = [(name, add_type_options) for name, add_type_options, _is_dc in name_group_raw]
+        name_group = [(name, alt_options) for name, alt_options, _is_dc in name_group_raw]
 
         free_candidates = [(mi, 0) for mi, mol in enumerate(state.molecules)
                             if len(mol.atoms) == 1 and mol.atoms[0].type == atype
@@ -1328,7 +1412,7 @@ def _combined_bond_reaction_neighbors(state: State, parts_available: int,
 
         if not sources:
             continue
-        pool_catalogs.append(list(_atype_reaction_catalog(state, reactions, name_group, sources)))
+        pool_catalogs.append(list(_atype_reaction_catalog(state, name_group, sources)))
 
     bond_actions, bond_catalogs = _bond_pool_catalogs(state, parts_available, get_orbits=get_orbits,
                                                         exclude_molecules=reaction_orbit_molecules)
@@ -1401,7 +1485,7 @@ def _atom_instances_by_type(state: State) -> Dict[int, List[Tuple[int, int]]]:
 
 
 _DROP_AND_CREATE = {"animismus", "dispersion", "unification"}
-_DROP_AND_CREATE_PREFIXES = ("purify_",)
+_DROP_AND_CREATE_PREFIXES = ("purify_", "proliferate_", "divide_")
 
 
 def _is_drop_and_create(name: str) -> bool:
@@ -1460,16 +1544,16 @@ def _choose_instances(state: State, remove_types: List[int]):
 
 
 def _is_space_limited(name: str) -> bool:
-    """Projection needs its quicksilver atom *and* a free hex next to the
-    atom it's projecting, to put the result in — that hex can't be shared
-    by two simultaneous firings, unlike e.g. calcification's plain in-place
-    relabel. See _free_neighbor_positions / _has_distinct_free_hexes: the
-    relabeled atom's own position is real, tracked board geometry (not an
+    """Rejection creates a brand-new quicksilver atom next to the metal atom
+    it's relabeling — that hex can't be shared by two simultaneous firings,
+    unlike e.g. calcification's plain in-place relabel. See
+    _free_neighbor_positions / _has_distinct_free_hexes: the relabeled
+    atom's own position is real, tracked board geometry (not an
     abstracted-away detail — see module docstring's Simplifications section
     on why only *its* position is real, not any second/third atom a
     multi-atom reaction also needs), so this can actually be checked rather
     than assumed unlimited."""
-    return name.startswith("project_")
+    return name.startswith("project_") or name.startswith("reject_")
 
 
 def _occupied_positions(state: State) -> set:
@@ -1654,21 +1738,19 @@ def _elementary_forward_reaction_actions(state: State, reactions: Dict[str, Reac
                                           name: str) -> List[ReactionAction]:
     """Every single forward k=1 firing of `name` currently available and
     legal — the mirror of _elementary_actions_for_name: consumes the
-    reagent side (`_reverse_reaction_options`'s "add_type_options", tried
-    as separate candidate alternatives for a combined calcify_X_or_Y
-    reaction) and produces the product side (its "remove_types", becoming
-    the fired ReactionAction's own add_types — the same field
-    _apply_mixed_actions already relabels/spawns from, regardless of which
-    direction populated it)."""
+    reagent side (`_reverse_reaction_options`'s add_types, tried as
+    separate candidate alternatives for a combined reaction) and produces
+    the product side (its remove_types, becoming the fired ReactionAction's
+    own add_types — the same field _apply_mixed_actions already
+    relabels/spawns from, regardless of which direction populated it)."""
     actions = []
     r = reactions[name]
-    produce_types, consume_type_options = _reverse_reaction_options(r)
-    for consume_types in consume_type_options:
-        display_name = f"calcify_{ATOM_NAMES[consume_types[0]]}" if r.alt_reagent else name
+    options = _reverse_reaction_options(r)
+    for alt_name, produce_types, consume_types in options:
         for chosen in _choose_instances(state, consume_types):
-            if not _firing_atoms_ok(state, name, chosen):
+            if not _firing_atoms_ok(state, alt_name, chosen):
                 continue
-            actions.append(ReactionAction(display_name, frozenset(chosen), name, chosen, produce_types))
+            actions.append(ReactionAction(alt_name, frozenset(chosen), name, chosen, produce_types))
     return actions
 
 
@@ -1882,8 +1964,8 @@ def _matches_raw_reagents(state: State, pf: PuzzleFile, recipe: RecipeResult, pr
     """True if `state` is exactly the puzzle's raw reagents, one unit copy
     each (per recipe.reagent_counts // _unit_scale — not products_needed
     directly, see initial_state's docstring for why). For a reagent
-    covered by a combined reaction group (recipe.extra_reactions, see
-    solve_recipe_combined), exact=False (the default) accepts ANY split of
+    covered by a combined reaction group (a recipe.reaction_counts entry
+    with .alternatives set, see solve_recipe_fast), exact=False (the default) accepts ANY split of
     single-atom molecules among the group's alternative types as long as
     their combined count matches the group's total — some split has to be
     accepted, since solve_recipe's own one arbitrary split may not even be
@@ -1893,24 +1975,41 @@ def _matches_raw_reagents(state: State, pf: PuzzleFile, recipe: RecipeResult, pr
     per-type numbers precisely, when some reachable state realizes them)
     and only falls back to this looser exact=False match if no state does.
     A linear scan rather than a signature dict-lookup — reachable_states
-    only needs this once, over however many states the BFS found."""
+    only needs this once, over however many states the BFS found.
+
+    recipe.reagent_counts (see stoichiometry.RecipeResult.reagent_counts /
+    solve_recipe_fast) is a (min, max) pair per index — min < max marks a
+    reagent whose max is a ceiling, not an exact target, so a state using
+    anywhere from 0 up to that many is accepted, not just an exact hit.
+    This is a different kind of flexibility than the combined-group one
+    above (which is exact on its *total*, just free about which specific
+    type each unit is) — a project_X_to_Y_or_purify_X_to_Y combined
+    reaction can genuinely need anywhere from the true minimum up to this
+    ceiling worth of the varying resource, depending on which alternative
+    a given firing chose, so pinning to an exact figure here would
+    wrongly reject real, cheaper decompositions."""
     g = _unit_scale(recipe, products_needed)
-    combined_types = {t for r in recipe.extra_reactions.values() for t in (r.alt_reagent or [])}
+    combined_types = {t for r in recipe.reaction_counts if r.alternatives is not None
+                       for t in (_single_atom_alt_types(r) or [])}
 
     def is_combined_atom(mol):
         atoms = mol.atom_type_counts()
         return len(atoms) == 1 and not mol.bonds and next(iter(atoms)) in combined_types
 
     expected = Counter()
-    for i, count in recipe.reagent_counts.items():
+    upper_bound_sigs = set()
+    for i, (lo, hi) in recipe.reagent_counts.items():
         mol = pf.inputs[i]
         if is_combined_atom(mol) and not exact:
             continue  # covered by combined_total instead of an exact per-reagent count
-        expected[molecule_signature(mol)] += count // g
+        sig = molecule_signature(mol)
+        expected[sig] += hi // g
+        if lo != hi:
+            upper_bound_sigs.add(sig)
 
     combined_total = None
     if not exact:
-        combined_total = sum(count // g for i, count in recipe.reagent_counts.items()
+        combined_total = sum(hi // g for i, (_lo, hi) in recipe.reagent_counts.items()
                               if is_combined_atom(pf.inputs[i]))
 
     remaining = Counter(expected)
@@ -1926,7 +2025,14 @@ def _matches_raw_reagents(state: State, pf: PuzzleFile, recipe: RecipeResult, pr
 
     if exact:
         return all(v == 0 for v in remaining.values())
-    return combined_found == combined_total and all(v == 0 for v in remaining.values())
+    # An upper-bound signature is satisfied by using anywhere from 0 up to
+    # its expected ceiling (remaining[sig] > 0 there just means less than
+    # the max was used, which is fine); every other signature still needs
+    # an exact hit (remaining[sig] == 0).
+    for sig, left in remaining.items():
+        if left != 0 and sig not in upper_bound_sigs:
+            return False
+    return combined_found == combined_total
 
 
 def reachable_states(pf: PuzzleFile, recipe: RecipeResult) -> StateGraph:
@@ -1935,11 +2041,11 @@ def reachable_states(pf: PuzzleFile, recipe: RecipeResult) -> StateGraph:
     the graph of every distinct state found, and which states are directly
     reachable from which."""
     reactions = {r.name: r for r in build_reactions(pf)}
-    reactions.update(recipe.extra_reactions)
+    reactions.update({r.name: r for r in recipe.reaction_counts if r.alternatives is not None})
     tracked_types = frozenset(
         atype
         for name, r in reactions.items()
-        if _is_drop_and_create(name) and recipe.reaction_counts.get(name, 0) > 0
+        if _is_drop_and_create(name) and recipe.reaction_counts.get(r, (0, 0))[1] > 0
         for atype, d in r.delta.items()
         if d > 0
     )

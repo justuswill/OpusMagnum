@@ -41,9 +41,7 @@ Usage:
   python schematic_parallel.py --puzzle P040 --check   # diff against schematic.reachable_states
 """
 
-import argparse
 import os
-import time
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from typing import Dict, List, Optional, Tuple
@@ -103,11 +101,11 @@ def reachable_states(pf: PuzzleFile, recipe: RecipeResult, workers: Optional[int
     # Duplicated from schematic.reachable_states by design (no changes to
     # schematic.py) — keep in sync if that logic ever changes there.
     reactions = {r.name: r for r in build_reactions(pf)}
-    reactions.update(recipe.extra_reactions)
+    reactions.update({r.name: r for r in recipe.reaction_counts if r.alternatives is not None})
     tracked_types = frozenset(
         atype
         for name, r in reactions.items()
-        if _is_drop_and_create(name) and recipe.reaction_counts.get(name, 0) > 0
+        if _is_drop_and_create(name) and recipe.reaction_counts.get(r, (0, 0))[1] > 0
         for atype, d in r.delta.items()
         if d > 0
     )
@@ -184,74 +182,3 @@ def _fingerprint(graph: StateGraph):
         for a, lst in graph.edges.items() for b in lst
     }
     return set(idx_to_key.values()), edges
-
-
-if __name__ == "__main__":
-    import schematic
-    from solve import find_puzzle_dir, load_puzzle
-    from stoichiometry import solve_recipe, solve_recipe_combined
-
-    parser = argparse.ArgumentParser(description="Parallel backward-BFS state-space search.")
-    parser.add_argument("--puzzle", required=True, metavar="ID", help="Puzzle ID, e.g. P040")
-    parser.add_argument("--workers", type=int, default=None,
-                         help="Worker process count (default: os.process_cpu_count())")
-    parser.add_argument("--batch-size", type=int, default=8,
-                         help="States per worker task (default: 8)")
-    parser.add_argument("--serial", action="store_true",
-                         help="Also run schematic.reachable_states for an A/B timing comparison")
-    parser.add_argument("--check", action="store_true",
-                         help="Run both serial and parallel and diff their content (implies --serial)")
-    args = parser.parse_args()
-
-    folder, collection = find_puzzle_dir(args.puzzle)
-    pf, puzzle_file = load_puzzle(folder, args.puzzle)
-    try:
-        recipe = solve_recipe_combined(pf)
-    except NotImplementedError:
-        recipe = solve_recipe(pf)
-
-    t0 = time.perf_counter()
-    graph = reachable_states(pf, recipe, workers=args.workers, batch_size=args.batch_size)
-    parallel_time = time.perf_counter() - t0
-    resolved_workers = args.workers if args.workers is not None else (os.process_cpu_count() or 1)
-    n_edges = sum(len(v) for v in graph.edges.values())
-    print(f"puzzle={args.puzzle} workers={resolved_workers} batch_size={args.batch_size} "
-          f"states={len(graph.states)} edges={n_edges} time={parallel_time:.2f}s")
-
-    if args.serial or args.check:
-        t0 = time.perf_counter()
-        serial_graph = schematic.reachable_states(pf, recipe)
-        serial_time = time.perf_counter() - t0
-        speedup = serial_time / parallel_time if parallel_time > 0 else float("inf")
-        efficiency = speedup / resolved_workers if resolved_workers > 0 else 0
-        print(f"serial: time={serial_time:.2f}s  speedup={speedup:.2f}x  "
-              f"parallel_efficiency={efficiency:.2%}")
-
-        if args.check:
-            p_nodes, p_edges = _fingerprint(graph)
-            s_nodes, s_edges = _fingerprint(serial_graph)
-            # The correctness bar is the *pair* set (from_key, to_key), not
-            # exact move-label text: when a target is reachable via more
-            # than one same-priority move, add_edge's "first one wins" tie
-            # keeps whichever the neighbor list happened to offer first —
-            # and that ordering can differ across worker processes (e.g.
-            # PYTHONHASHSEED varies per process), same as it can differ
-            # across unrelated code-path changes within one process. This
-            # never affects any downstream numeric bound (bounds.py only
-            # uses edge_move for a human-readable note string) — verified
-            # via full solve_analysis.py output diffs during this module's
-            # development. Exact label match is reported as an FYI below,
-            # not part of PASS/FAIL.
-            p_pairs, s_pairs = set(p_edges), set(s_edges)
-            pairs_ok = p_pairs == s_pairs
-            labels_ok = p_edges == s_edges
-            nodes_ok = p_nodes == s_nodes
-            print(f"nodes match: {nodes_ok}  edge pairs match: {pairs_ok}  "
-                  f"(exact move-label text also matches: {labels_ok})")
-            if not nodes_ok:
-                print(f"  serial-only nodes: {len(s_nodes - p_nodes)}  "
-                      f"parallel-only nodes: {len(p_nodes - s_nodes)}")
-            if not pairs_ok:
-                print(f"  serial-only edge pairs: {len(s_pairs - p_pairs)}  "
-                      f"parallel-only edge pairs: {len(p_pairs - s_pairs)}")
-            print("PASS" if nodes_ok and pairs_ok else "FAIL")

@@ -198,6 +198,26 @@ class PuzzleFile:
         return 6 * self.output_scale
 
 
+def _is_repeat_reagent(mol: Molecule) -> bool:
+    """True for the synthetic single-atom reagent _repeat_reagent_inputs
+    creates — never a real reagent the puzzle file itself defines."""
+    return len(mol.atoms) == 1 and mol.atoms[0].type == ATOM_REPEAT and not mol.bonds
+
+
+def _repeat_reagent_inputs(outputs: List[Molecule]) -> List[Molecule]:
+    """One dedicated single-atom reagent per ATOM_REPEAT marker actually
+    present across `outputs` — not just one regardless of how many markers
+    exist. Each marker is a structurally distinct position schematic.py's
+    backward search has to isolate and grab an atom for when fully
+    un-bonding the output (see the ATOM_REPEAT comment where this used to
+    be inlined), so it needs its own reagent slot — the same way any other
+    duplicate input does (see _build_recipe_lp's signature-based duplicate
+    detection, which then correctly reports "[x{count}]"). Returns an
+    empty list when there's no repeat atom at all."""
+    count = sum(1 for mol in outputs for a in mol.atoms if a.type == ATOM_REPEAT)
+    return [Molecule(atoms=[Atom(type=ATOM_REPEAT, u=0, v=0)], bonds=[]) for _ in range(count)]
+
+
 def mirror_repeat_molecule(mol: Molecule) -> Optional[Molecule]:
     """Alternate construction of a repeating output molecule: mirror its
     repeat marker(s) onto the opposite end instead of the one the puzzle
@@ -268,7 +288,13 @@ def alternate_repeat_puzzle(pf: PuzzleFile) -> Optional[PuzzleFile]:
         if mirrored is None:
             return None
         new_outputs.append(mirrored)
-    return replace(pf, outputs=new_outputs)
+    # The mirrored orientation can have a different number of repeat
+    # markers per output than the original (mirror_repeat_molecule adds
+    # one new marker per bond the original had) — reusing pf.inputs
+    # unchanged would keep stale reagent count/slots from the ORIGINAL
+    # marker count. Drop those and regenerate to match new_outputs.
+    new_inputs = [m for m in pf.inputs if not _is_repeat_reagent(m)] + _repeat_reagent_inputs(new_outputs)
+    return replace(pf, inputs=new_inputs, outputs=new_outputs)
 
 
 class _Parser:
@@ -339,13 +365,12 @@ class _Parser:
         conduit_capacity_per_chamber: List[int] = []
         if is_production:
             is_isolated, conduit_capacities, cabinet_sizes, conduit_capacity_per_chamber = self._production_info()
-        if any(a.type == ATOM_REPEAT for mol in outputs for a in mol.atoms):
-            # ATOM_REPEAT is a structural marker in the output, not a real
-            # atom the puzzle file lists a reagent for — but schematic.py's
-            # backward search still has to isolate and "grab" one from
-            # somewhere when it fully un-bonds the output, so give it a
-            # dedicated single-atom reagent to reduce down to.
-            inputs.append(Molecule(atoms=[Atom(type=ATOM_REPEAT, u=0, v=0)], bonds=[]))
+        # ATOM_REPEAT is a structural marker in the output, not a real atom
+        # the puzzle file lists a reagent for — but schematic.py's backward
+        # search still has to isolate and "grab" one from somewhere when it
+        # fully un-bonds the output, so give it a dedicated single-atom
+        # reagent per marker actually present (see _repeat_reagent_inputs).
+        inputs.extend(_repeat_reagent_inputs(outputs))
         return PuzzleFile(
             name=name,
             parts_available=parts_available,

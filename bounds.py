@@ -8,10 +8,11 @@ A metric is *proven optimal* when one of these bounds equals the best known reco
 
 import itertools
 import math
+import warnings
 from collections import Counter, deque
 from dataclasses import replace
 from fractions import Fraction
-from typing import Optional
+from typing import List, Optional, Tuple
 from weakref import WeakKeyDictionary
 
 from puzzle_parser import (
@@ -22,13 +23,14 @@ from puzzle_parser import (
     PART_REJECTION, PART_DIVISION, PART_PROLIFERATION, PART_RAVARI,
     PART_CALCIFICATION, PART_DUPLICATION, PART_ANIMISMUS, PART_DISPERSION, PART_DISPOSAL,
     PART_BONDER, PART_UNBONDER, PART_BONDER_PRISMA,
-    alternate_repeat_puzzle,
 )
 from stoichiometry import (
-    RecipeResult, METAL_CHAIN, DIVISION_OUTPUTS, necessary_inputs, describe_molecule,
-    solve_recipe, solve_recipe_combined, solve_recipe_cheap, solve_recipe_min_waste,
+    RecipeResult, METAL_CHAIN, DIVISION_OUTPUTS, necessary_inputs, necessary_atoms, describe_molecule,
+    recipe_waste_feasible,
 )
-from schematic import StateGraph, molecule_signature, _is_drop_and_create, _HEX_DIRS, _rotate60
+from schematic import (
+    StateGraph, molecule_signature, _is_drop_and_create, _single_atom_alt_types, _HEX_DIRS, _rotate60,
+)
 from schematic_parallel import reachable_states
 
 _cadence_latency_memo: "WeakKeyDictionary[StateGraph, tuple]" = WeakKeyDictionary()
@@ -60,7 +62,7 @@ def _all_paths_nodes(graph: StateGraph, start: int, goal: int) -> list:
 
 def _reagent_sig(pf: PuzzleFile, recipe: RecipeResult) -> dict:
     return {molecule_signature(pf.inputs[i]): i
-            for i, count in recipe.reagent_counts.items() if count > 0}
+            for i, (_lo, hi) in recipe.reagent_counts.items() if hi > 0}
 
 
 def _path_raw_ls(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph, path: list) -> dict:
@@ -525,11 +527,11 @@ def _cadence_latency(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph) ->
 
     products_needed = pf.products_needed()
     period = 1
-    for i, count in recipe.reagent_counts.items():
-        if count <= 0:
+    for i, (_lo, hi) in recipe.reagent_counts.items():
+        if hi <= 0:
             continue
         repeats = recipe.reagent_group_size.get(i, 1)
-        unit_count = Fraction(count, products_needed)
+        unit_count = Fraction(hi, products_needed)
         period = math.lcm(period, unit_count.denominator * (repeats // math.gcd(unit_count.numerator, repeats)))
 
     # paths = _all_paths_nodes(graph, graph.input_state_idx, 0)
@@ -539,11 +541,14 @@ def _cadence_latency(pf: PuzzleFile, recipe: RecipeResult, graph: StateGraph) ->
     paths = [path for path, _raw_ls in pareto]
     raw_ls_by_path = {id(path): raw_ls for path, raw_ls in pareto}
 
+    # try more periods for batching
+    periods = {period, 2} if period == 1 else {period}
     best = None
-    for assignment in itertools.combinations_with_replacement(paths, period):
-        L_spine, note = _path_l_spine(pf, recipe, graph, list(assignment), raw_ls_by_path)
-        if best is None or L_spine < best[0]:
-            best = (L_spine, note)
+    for period_candidate in periods:
+        for assignment in itertools.combinations_with_replacement(paths, period_candidate):
+            L_spine, note = _path_l_spine(pf, recipe, graph, list(assignment), raw_ls_by_path)
+            if best is None or L_spine < best[0]:
+                best = (L_spine, note)
     _cadence_latency_memo[graph] = (id(recipe), best)
     return best
 
@@ -584,17 +589,20 @@ def cycles_lower_bound_single(pf: PuzzleFile, recipe: RecipeResult, states: Stat
     note_in = ""
 
     combined_reagent_indices = set()
-    for r in recipe.extra_reactions.values():
+    for r in recipe.reaction_counts:
+        if r.alternatives is None:
+            continue
+        alt_types = _single_atom_alt_types(r) or []
         member_indices = [
             i for i, mol in enumerate(pf.inputs)
             if i in recipe.reagent_counts
             and len(mol.atom_type_counts()) == 1
-            and next(iter(mol.atom_type_counts())) in (r.alt_reagent or [])
+            and next(iter(mol.atom_type_counts())) in alt_types
         ]
         if not member_indices:
             continue
         combined_reagent_indices.update(member_indices)
-        total_count = sum(recipe.reagent_counts.get(i, 0) for i in member_indices)
+        total_count = sum(recipe.reagent_counts.get(i, (0, 0))[1] for i in member_indices)
         total_repeats = sum(recipe.reagent_group_size.get(i, 1) for i in member_indices)
         if total_count <= 0:
             continue
@@ -608,7 +616,7 @@ def cycles_lower_bound_single(pf: PuzzleFile, recipe: RecipeResult, states: Stat
             note_in = (f"input throughput {N_in}: {total_count}x needed from combined "
                        f"{total_repeats} duplicates ({breakdown})")
 
-    for i, count in recipe.reagent_counts.items():
+    for i, (_lo, count) in recipe.reagent_counts.items():
         if i in combined_reagent_indices:
             continue  # already accounted for, pooled with the rest of its combined group above
         if count <= 0:
@@ -641,33 +649,33 @@ def cycles_lower_bound_single(pf: PuzzleFile, recipe: RecipeResult, states: Stat
     return total, f"{note}, {latency_note}"
 
 
-def cycles_lower_bound(pf: PuzzleFile, recipe: RecipeResult, states: StateGraph,
-                        workers: Optional[int] = None, batch_size: int = 8) -> tuple[int, str]:
-    """cycles_lower_bound_single(pf), plus — for a repeating output — the same
-    computation with the repeat marker(s) mirrored onto the opposite end
-    (see puzzle_parser.alternate_repeat_puzzle): a real solution isn't
-    required to build the polymer in the direction the puzzle file happens
-    to depict, so try both and keep whichever gives the smaller (still
-    sound) bound. `workers`/`batch_size` only affect the mirrored-repeat
-    side's own reachable_states call (schematic_parallel) — `states` for
-    the primary orientation is passed in already computed."""
-    c_lo, c_note = cycles_lower_bound_single(pf, recipe, states)
+def cycles_lower_bound(recipes: List[Tuple[PuzzleFile, RecipeResult]], workers: Optional[int] = None,
+                        batch_size: int = 8) -> tuple[PuzzleFile, RecipeResult, StateGraph, int, str]:
+    """The cycles lower bound across every (puzzle_variant, recipe) pair in
+    `recipes` — typically solve_recipe_fast's own output, which already
+    includes both the primary orientation's slack sweep and, for a
+    repeating output, the mirrored-construction-direction variant's own
+    sweep too (see puzzle_parser.alternate_repeat_puzzle: a real solution
+    isn't required to build the polymer in the direction the puzzle file
+    happens to depict). Keeps whichever pair gives the smallest (still
+    sound) bound — a recipe rigid at the exact reagent optimum can hide a
+    cycles-cheaper alternative one slack step away (see P095-Reactive-Gold:
+    every step of its metal chain is completely fixed at slack=0, but the
+    full project/purify choice at every step only appears at slack=1).
+    This loop lives here rather than in every caller so callers just get
+    the winning puzzle_variant/recipe/states/bound back together, ready to
+    feed into something like cycles_lower_bound_for_budget without
+    recomputing anything. No try/except around the loop body — a candidate
+    hitting the known bidirectional-search AssertionError propagates
+    straight out rather than being silently dropped."""
+    best = None
+    for variant_pf, recipe in recipes:
+        states = reachable_states(variant_pf, recipe, workers=workers, batch_size=batch_size)
+        c_lo, c_note = cycles_lower_bound_single(variant_pf, recipe, states)
+        if best is None or c_lo < best[3]:
+            best = (variant_pf, recipe, states, c_lo, c_note)
 
-    alt_pf = alternate_repeat_puzzle(pf)
-    if alt_pf is not None:
-        try:
-            try:
-                alt_recipe = solve_recipe_combined(alt_pf)
-            except NotImplementedError:
-                alt_recipe = solve_recipe(alt_pf)
-            alt_states = reachable_states(alt_pf, alt_recipe, workers=workers, batch_size=batch_size)
-            alt_c_lo, alt_c_note = cycles_lower_bound_single(alt_pf, alt_recipe, alt_states)
-        except AssertionError:
-            alt_c_lo = None
-        if alt_c_lo is not None and alt_c_lo < c_lo:
-            c_lo, c_note = alt_c_lo, alt_c_note + " (mirrored repeat)"
-
-    return c_lo, c_note
+    return best
 
 
 # ── Cycle bounds at fixed costs ───────────────────────────────────────
@@ -737,7 +745,7 @@ def cycles_lower_bound_for_budget(pf: PuzzleFile, recipe: RecipeResult, states: 
     given throughput harder to afford), so the smallest N with
     cost <= arm_budget is found by doubling to bracket, then binary
     search."""
-    k = sum(count for count in recipe.reagent_counts.values() if count > 0)
+    k = sum(hi for _lo, hi in recipe.reagent_counts.values() if hi > 0)
 
     L, spine_note = _cadence_latency(pf, recipe, states)
     all_repeating = all(any(a.type == ATOM_REPEAT for a in mol.atoms) for mol in pf.outputs)
@@ -1704,7 +1712,7 @@ def _resolve_tetra_bond(pf: PuzzleFile, needed: dict, needs_bonder: bool, needs_
     return forward, reverse
 
 
-def _needs_second_arm(pf: PuzzleFile, recipe: RecipeResult, needed: dict) -> bool:
+def _needs_second_arm(pf: PuzzleFile, needed: dict) -> bool:
     """Whether the production layout can't be worked by a single arm in a
     single chamber: either inputs/outputs are architecturally split
     (is_isolated), or the working area (plus space taken up by any conduit
@@ -1718,12 +1726,12 @@ def _needs_second_arm(pf: PuzzleFile, recipe: RecipeResult, needed: dict) -> boo
     biggest_chamber_conduit_capacity = pf.conduit_capacity_per_chamber[
         pf.cabinet_sizes.index(max(pf.cabinet_sizes))]
     return (
-        area_lower_bound(pf, recipe, needed)[0] + biggest_chamber_conduit_capacity
+        area_lower_bound(pf, needed)[0] + biggest_chamber_conduit_capacity
         > max(pf.cabinet_sizes)
     )
 
 
-def _needs_piston_arm(pf: PuzzleFile, recipe: RecipeResult, needed: dict, tracks: int) -> bool:
+def _needs_piston_arm(pf: PuzzleFile, needed: dict, tracks: int) -> bool:
     """Whether the chamber has room for the puzzle's atoms/glyphs/conduits
     alone, but not for that plus the track the arm needs to reach
     everything — track is laid down as physical hexes, but (unlike area
@@ -1736,11 +1744,11 @@ def _needs_piston_arm(pf: PuzzleFile, recipe: RecipeResult, needed: dict, tracks
     assert len(pf.conduit_capacity_per_chamber) == len(pf.cabinet_sizes)
     biggest_chamber_conduit_capacity = pf.conduit_capacity_per_chamber[
         pf.cabinet_sizes.index(max(pf.cabinet_sizes))]
-    base_area, note = area_lower_bound(pf, recipe, needed)
+    base_area, note = area_lower_bound(pf, needed)
     return base_area - (1 if 'access' in note else 0) + biggest_chamber_conduit_capacity + tracks > max(pf.cabinet_sizes)
 
 
-def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
+def _needed_parts(pf: PuzzleFile) -> dict:
     """
     Which extra parts a solution is provably forced to buy, from atom-type
     and bond-type presence/absence between inputs and outputs, plus how
@@ -1792,7 +1800,7 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
     freespace_needs_bonder = needs_bonder
     if pf.is_production and pf.is_isolated and pf.conduit_capacities:
         conduit_capacity = max(pf.conduit_capacities)
-        needed_input_idxs = necessary_inputs(pf, recipe)
+        needed_input_idxs = necessary_inputs(pf)
         if needed_input_idxs and conduit_capacity < max(len(pf.inputs[i].atoms) for i in needed_input_idxs):
             assert pf.parts_available & PART_UNBONDER
             needs_unbonder = True
@@ -1878,11 +1886,7 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
             for up_opt in up_options:
                 for down_opt in down_options:
                     restricted_pf = replace(pf, parts_available=base_parts | up_opt | down_opt)
-                    try:
-                        limited_recipe = solve_recipe_min_waste(restricted_pf)
-                    except ValueError:
-                        continue
-                    if all(t in allowed_waste_types for t in limited_recipe.waste):
+                    if recipe_waste_feasible(restricted_pf, waste_types_allowed=allowed_waste_types):
                         return True
             return False
 
@@ -1890,8 +1894,8 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
             needed["waste"] = not waste_type_avoidable()
         else:
             assert pf.cabinet_sizes
-            needs_second_arm = _needs_second_arm(pf, recipe, needed)
-            input_atoms = sum(pf.inputs[i].atom_count() for i in necessary_inputs(pf, recipe))
+            needs_second_arm = _needs_second_arm(pf, needed)
+            input_atoms = sum(pf.inputs[i].atom_count() for i in necessary_atoms(pf))
             smallest_output = min(
                 6 * (mol.atom_count() - 1) if any(a.type == ATOM_REPEAT for a in mol.atoms)
                 else mol.atom_count()
@@ -1908,23 +1912,12 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
                 assert pf.conduit_capacities
                 free_space += max(pf.conduit_capacities) * extra_chambers
 
-            def acceptable(waste: Optional[dict]) -> bool:
-                if waste is None:
-                    return False
-                return sum(waste.values()) <= free_space
+            def waste_for(parts: int) -> bool:
+                return recipe_waste_feasible(replace(pf, parts_available=parts), waste_max=free_space)
 
-            def waste_for(parts: int) -> Optional[dict]:
-                try:
-                    return solve_recipe_min_waste(replace(pf, parts_available=parts)).waste
-                except ValueError:
-                    return None
-
-            def waste_for_excluding(reaction_name: str) -> Optional[dict]:
-
-                try:
-                    return solve_recipe_min_waste(pf, excluded_reactions=frozenset({reaction_name})).waste
-                except ValueError:
-                    return None
+            def waste_for_excluding(reaction_name: str) -> bool:
+                return recipe_waste_feasible(
+                    pf, waste_max=free_space, excluded_reactions=frozenset({reaction_name}))
 
             already_proj = metal_glyph_up is not None and "projection" == metal_glyph_up
             already_pur = metal_glyph_up is not None and "purification" == metal_glyph_up
@@ -1946,10 +1939,7 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
                 if (pf.parts_available & p) and not already
             ]
 
-            already_fine = any(
-                acceptable(waste_for(base_parts | up_opt | down_opt))
-                for up_opt in up_options for down_opt in down_options
-            )
+            already_fine = waste_for(base_parts)
             if already_fine:
                 needed["waste"] = not waste_type_avoidable()
             elif pf.parts_available & PART_DISPOSAL:
@@ -1957,10 +1947,10 @@ def _needed_parts(pf: PuzzleFile, recipe: RecipeResult) -> dict:
                 needed["waste"] = True
             else:
                 # Force a waste-less solution
-                assert acceptable(waste_for(pf.parts_available))
+                assert waste_for(pf.parts_available)
                 best_required = {
                     name for name, p in waste_candidates
-                    if not acceptable(
+                    if not (
                         waste_for_excluding(name) if name in ("dispersion", "unification")
                         else waste_for(pf.parts_available & ~p)
                     )
@@ -2029,8 +2019,9 @@ def _resolve_metal_glyphs(needed: dict, use_metal_up: bool, use_metal_down: bool
     return metal_glyph_up, metal_glyph_down
 
 
-def _tracks_access(pf: PuzzleFile, recipe: RecipeResult, needed: dict,
-                    use_metal_up: bool, use_metal_down: bool) -> tuple[int, int, int, Optional[str], Optional[str], str, bool]:
+def _tracks_access(pf: PuzzleFile, needed: dict,
+                    use_metal_up: bool, use_metal_down: bool,
+                    needs_second_arm: bool = False) -> tuple[int, int, int, Optional[str], Optional[str], str, bool]:
     """Access-point/Track accounting for cost_lower_bound, parameterized by
     which metal-glyph direction(s) this call actually buys since
     purification/division each carry their own extra track/access cost
@@ -2068,7 +2059,7 @@ def _tracks_access(pf: PuzzleFile, recipe: RecipeResult, needed: dict,
 
     has_input_bonds = any(mol.bonds for mol in pf.inputs)
     input_access = len({
-        i for i in necessary_inputs(pf, recipe)
+        i for i in necessary_inputs(pf)
         if not any(a.type == ATOM_REPEAT for a in pf.inputs[i].atoms)
     })
     output_access = sum(1 for mol in pf.outputs if not any(a.type == ATOM_REPEAT for a in mol.atoms))
@@ -2172,7 +2163,7 @@ def _tracks_access(pf: PuzzleFile, recipe: RecipeResult, needed: dict,
     access_note = " + ".join(access_parts)
 
     baseline_tracks = tracks
-    free_access = 12 if (pf.is_production and pf.is_isolated) else 6
+    free_access = 10 if needs_second_arm else 6
     if free_access < access:
         tracks = max(tracks, 1)
     while max(0, tracks - 1) * 6 < access - free_access:
@@ -2181,7 +2172,7 @@ def _tracks_access(pf: PuzzleFile, recipe: RecipeResult, needed: dict,
     return access, tracks, baseline_tracks, metal_glyph_up, metal_glyph_down, access_note, needs_bonder
 
 
-def cost_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
+def cost_lower_bound(pf: PuzzleFile) -> tuple[int, str]:
     """
     Minimum cost based on required parts, plus track if this puzzle's glyphs outnumber what a bare arm can reach.
 
@@ -2211,13 +2202,14 @@ def cost_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
     refs:
     https://biggieblog.com/optimizing-cost-in-opus-magnum/
     """
-    needed = _needed_parts(pf, recipe)
+    needed = _needed_parts(pf)
+    needs_second_arm = _needs_second_arm(pf, needed)
 
     use_metal_up = needed["metal_up_mandatory"]
     use_metal_down = needed["metal_down_mandatory"]
     if needed["metal_either"] and not use_metal_up and not use_metal_down:
-        access_up, tracks_up, baseline_up, glyph_up_up, glyph_down_up, note_up, bonder_up = _tracks_access(pf, recipe, needed, True, False)
-        access_down, tracks_down, baseline_down, glyph_up_down, glyph_down_down, note_down, bonder_down = _tracks_access(pf, recipe, needed, False, True)
+        access_up, tracks_up, baseline_up, glyph_up_up, glyph_down_up, note_up, bonder_up = _tracks_access(pf, needed, True, False, needs_second_arm)
+        access_down, tracks_down, baseline_down, glyph_up_down, glyph_down_down, note_down, bonder_down = _tracks_access(pf, needed, False, True, needs_second_arm)
         if tracks_down < tracks_up:
             use_metal_down = True
             access, tracks, baseline_tracks, access_note, needs_bonder = access_down, tracks_down, baseline_down, note_down, bonder_down
@@ -2228,18 +2220,17 @@ def cost_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
             metal_glyph_up, metal_glyph_down = glyph_up_up, glyph_down_up
     else:
         access, tracks, baseline_tracks, metal_glyph_up, metal_glyph_down, access_note, needs_bonder = _tracks_access(
-            pf, recipe, needed, use_metal_up, use_metal_down)
+            pf, needed, use_metal_up, use_metal_down, needs_second_arm)
 
-    needs_second_arm = _needs_second_arm(pf, recipe, needed)
     uses_piston = False
     if needs_second_arm:
         g_lo = 40
         reasons = ["2×arm=40g"]
-    elif _needs_piston_arm(pf, recipe, needed, tracks):
+    elif _needs_piston_arm(pf, needed, tracks):
         uses_piston = True
         g_lo = 40
         reasons = ["1×piston-arm=40g"]
-        if "access" in area_lower_bound(pf, recipe, needed)[1]:
+        if "access" in area_lower_bound(pf, needed)[1]:
             g_lo += 10
             reasons.append("2×track=10g")
     else:
@@ -2301,7 +2292,7 @@ def cost_lower_bound(pf: PuzzleFile, recipe: RecipeResult) -> tuple[int, str]:
     return g_lo, note
 
 
-def area_lower_bound(pf: PuzzleFile, recipe: RecipeResult, needed: Optional[dict] = None) -> tuple[int, str]:
+def area_lower_bound(pf: PuzzleFile, needed: Optional[dict] = None) -> tuple[int, str]:
     """
     Minimum area based on required parts plus one hex per required input/output atom.
 
@@ -2309,7 +2300,7 @@ def area_lower_bound(pf: PuzzleFile, recipe: RecipeResult, needed: Optional[dict
       - 0 track: 7+0, 2 track: 4+6, 3 track: 3+10
     """
     if needed is None:
-        needed = _needed_parts(pf, recipe)
+        needed = _needed_parts(pf)
     use_metal_up = needed["metal_up_mandatory"]
     use_metal_down = needed["metal_down_mandatory"]
     metal_glyph_up, metal_glyph_down = _resolve_metal_glyphs(needed, True, True)
@@ -2363,7 +2354,7 @@ def area_lower_bound(pf: PuzzleFile, recipe: RecipeResult, needed: Optional[dict
         a_lo += 1
         reasons.append("access=1")
 
-    input_atoms = sum(pf.inputs[i].atom_count() for i in necessary_inputs(pf, recipe))
+    input_atoms = sum(pf.inputs[i].atom_count() for i in necessary_atoms(pf))
     output_atoms = sum(
         6 * (mol.atom_count() - 1) if any(a.type == ATOM_REPEAT for a in mol.atoms)
         else mol.atom_count()

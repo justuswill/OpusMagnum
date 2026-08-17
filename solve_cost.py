@@ -31,7 +31,6 @@ import struct
 
 from bounds import cost_lower_bound
 from solve_analysis import find_puzzle_dir, load_puzzle, parse_solutions, verify_with_omsim
-from stoichiometry import solve_recipe, solve_recipe_combined
 import solve_tape
 import solve_tape_parallel
 
@@ -167,12 +166,8 @@ def check_template_against_note(template_path: str, note: str):
 def main(args):
     folder, _collection = find_puzzle_dir(args.puzzle)
     pf, puzzle_path = load_puzzle(folder, args.puzzle)
-    try:
-        recipe = solve_recipe_combined(pf)
-    except NotImplementedError:
-        recipe = solve_recipe(pf)
 
-    g_lo, note = cost_lower_bound(pf, recipe)
+    g_lo, note = cost_lower_bound(pf)
     print(f"{args.puzzle} {pf.name}: cost lower bound = {g_lo}g")
     print(f"  note: {note}")
 
@@ -223,7 +218,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Compute cost_lower_bound and cross-check it against a template solution's actual parts.")
-    parser.add_argument("--puzzle", default="P202", help="Puzzle ID")
+    parser.add_argument("--puzzle", default="P095", help="Puzzle ID")
     parser.add_argument("--max-cycles", type=int, default=16384,
                          help="BFS depth cap for the instruction-tape search (default: 100)")
     parser.add_argument("--workers", type=int, default=os.process_cpu_count(),
