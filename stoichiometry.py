@@ -29,9 +29,12 @@ ASSUMPTIONS:
 - heuristics big_m / pi_bound / scale are large enough.
 """
 
+import hashlib
 import math
-from dataclasses import dataclass, field, replace
+import pickle
+from dataclasses import asdict, dataclass, field, replace
 from os.path import commonprefix
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import pulp
@@ -471,11 +474,26 @@ def solve_recipe_flexibility(pf: PuzzleFile, slack: int = 0) -> RecipeResult:
     )
 
 
+_RECIPE_CACHE_DIR = Path(__file__).parent / ".recipe_cache"
+
+
+def _recipe_cache_key(pf: PuzzleFile) -> str:
+    return hashlib.sha256(repr(asdict(pf)).encode()).hexdigest()
+
+
 def solve_recipe_fast(pf: PuzzleFile) -> List[Tuple[PuzzleFile, RecipeResult]]:
     """
     List of recipes with low number of input sets.
     Allow for several recipes with slower throughput if they could have lower latency.
     """
+    cache_path = _RECIPE_CACHE_DIR / f"{_recipe_cache_key(pf)}.pkl"
+    if cache_path.exists():
+        try:
+            with open(cache_path, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            pass
+
     def sweep(variant: PuzzleFile) -> List[RecipeResult]:
         results: List[RecipeResult] = []
         prev_key = None
@@ -504,6 +522,10 @@ def solve_recipe_fast(pf: PuzzleFile) -> List[Tuple[PuzzleFile, RecipeResult]]:
     alt_pf = alternate_repeat_puzzle(pf)
     if alt_pf is not None:
         results.extend((alt_pf, r) for r in sweep(alt_pf))
+
+    _RECIPE_CACHE_DIR.mkdir(exist_ok=True)
+    with open(cache_path, "wb") as f:
+        pickle.dump(results, f)
     return results
 
 
